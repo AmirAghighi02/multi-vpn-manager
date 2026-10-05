@@ -1,0 +1,11 @@
+# local state — contains your VPN names, IPs and routes; never commit
+configs/
+state/
+logs/
+backups/
+.mvm.json
+# python
+.venv/
+__pycache__/
+*.pyc
+*.tmp*
