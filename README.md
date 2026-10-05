@@ -21,7 +21,12 @@ python3 mvm.py doctor   # troubleshooting; works with no packages installed
 | Area | What you get |
 |---|---|
 | **Discovery** | Lists every VPN defined in the GUI (NetworkManager) plus your sshuttle profiles. Press `a` to *adopt* a GUI VPN. |
-| **Routes** | Each VPN has its own list of IPs, CIDRs and **IP ranges** that go through it. Edit the list in the TUI, or import a `.txt` file. |
+| **Routes** | Each VPN has its own list of IPs, CIDRs, **IP ranges** and **hostnames** that go through it. Edit the list in the TUI, or import a `.txt` file. |
+| **Hostnames** | Entries like `git.example.com` are resolved to IPs when routes are applied, then re-resolved every `dns_refresh` seconds (default 300). If the IPs change, the routes of a running VPN are re-applied automatically. sshuttle VPNs get a notice instead, because sshuttle only reads its routes at start. |
+| **Health probes** | Per VPN: `host:port` (TCP), `http(s)://url` (HTTP; any status below 500 counts as reachable) or `ping:host`. They're checked every `probe_interval` seconds while the VPN is up. A VPN whose tunnel is up but whose target doesn't answer shows as **◍ DEGRADED**. |
+| **Notifications** | Desktop notifications (`notify-send`) when a VPN drops, loses routes, has a failing probe or recovers, and for autostart results. They can be turned off globally (Settings) or per VPN (Edit → notify). Up/down that you start yourself doesn't trigger them. |
+| **Event timeline** | Up, down, drop, lost routes, recovery, probe and DNS changes, and config edits, logged in `state/events.jsonl`. Shown on the dashboard and in each VPN's detail panel, together with a latency sparkline. |
+| **Export / import** | A JSON bundle of configs, **never secrets**. Machine-specific fields (profile UUIDs, autostart) are dropped. Options strip routes/probes or SSH hosts/hostnames. On import, VPNs are linked to local GUI profiles by name. |
 | **Up / down / restart** | `nmcli` brings the GUI profile up, then the routes are added. For sshuttle, the process is started and watched. |
 | **Credentials** | Read from the GUI profile: shows whether each secret is saved in the profile, kept in the keyring, or asked every time, and whether it's actually stored. `s` saves all secrets into the profile **in one call**, because writing them one by one makes NetworkManager erase the earlier ones. Values are never shown or logged. |
 | **Status / analysis** | Interface, local IP, gateway, uptime, traffic and rate sparkline. Route health checks where each IP *really* goes right now (`ip route get`). |
@@ -95,6 +100,7 @@ A routes file has one entry per line. `#` comments, commas and spaces are fine.
 | `10.0.0.5-10.0.0.20` or `10.0.0.5 - 10.0.0.20` | IP range, inclusive |
 | `10.0.0.5-20` | shorthand: the last octet changes |
 | `10.1.2.*` / `10.1.*.*` | wildcard, the same as `/24` / `/16` |
+| `git.example.com` | hostname: every IPv4 address it resolves to (`/32` each), refreshed automatically |
 
 Ranges are kept in the config exactly as you wrote them. When routes are applied, each range is split into
 the smallest set of CIDR blocks: `10.0.0.5-10.0.0.20` becomes `.5/32 .6/31 .8/29 .16/30 .20/32`. The routing map
@@ -112,6 +118,15 @@ Limits: at most 64 blocks per range, and nothing that covers `0.0.0.0/0`.
 | `a` | adopt a GUI VPN that isn't managed yet | `n` | new sshuttle profile |
 | `o` | toggle autostart | `l` | show logs of the selected VPN |
 | `f` | apply the fix of the selected troubleshoot row | `q` | quit |
+| `v` | watch the output of the last or running up/down | `h` | hide or unhide the selected VPN row |
+
+**VPN list:** type in the filter box above the list (name, type, state, interface, words in any order). The **hidden** switch shows hidden rows.
+
+**Up / down:** progress appears in the VPN's row as a spinner, and a toast tells you when it's done; press `v` for the full output. *Settings → Up / down progress → popup* brings back the live-log dialog.
+
+**Logs tab:** search box (matches are highlighted), level filter (all / warnings + errors / errors only), and **Next error** to jump between error lines.
+
+**Shared IPs:** the routing map and the detail panel mark ● for the VPN that carries a shared IP right now and ○ for the others claiming it. Press `p` on a VPN to take its shared IPs.
 
 ## CLI reference
 
@@ -127,6 +142,10 @@ mvm.py delete NAME             forget it (config -> .deleted; GUI profile untouc
 mvm.py secrets NAME            store credentials in the GUI profile (hidden prompt)
 mvm.py doctor [NAME] [--deep] [--fix] [--json]
 mvm.py logs NAME [-n 80] [-f] [-j]      -j adds the system journal lines
+mvm.py probes NAME [list|add T..|rm T..|run]   T = host:port | http(s)://url | ping:host
+mvm.py dns [NAME]              resolve the hostnames in route lists now, report changed IPs
+mvm.py export [NAMES..] [-o FILE] [--strip-routes] [--strip-hosts]
+mvm.py import FILE [--overwrite]
 mvm.py graph | foreign | colors
 mvm.py autostart NAME on|off
 mvm.py sudoers [install|show|check]
@@ -158,6 +177,9 @@ Also:
 ```
 configs/<vpn>.json   routes + options (backups in backups/, deleted -> .json.deleted)
 state/<vpn>.json     what is currently applied (iface, gateway, routes, rules, sshuttle pid)
+state/<vpn>.probes.json  last health-probe results
+state/events.jsonl   event timeline
+state/dns-cache.json resolved hostnames
 logs/<vpn>.log       per-VPN log (rotated at 1 MB)
 .mvm.json            settings
 .venv/               textual + rich (created by bootstrap)
@@ -177,7 +199,9 @@ Example `configs/office.json`:
   "never_default": true,
   "ssh_remote": "",
   "ssh_args": "",
-  "note": ""
+  "note": "",
+  "probes": ["192.0.2.22:9000", "https://intranet.example/health"],
+  "notify": true
 }
 ```
 

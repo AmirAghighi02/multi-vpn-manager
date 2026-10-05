@@ -167,6 +167,11 @@ def default_settings() -> Dict[str, Any]:
         "policy_rules": True,                    # add `to IP lookup main prio 30` so foreign policy routing can't steal our IPs
         "journal_minutes": 180,
         "colors": "auto",
+        "probe_interval": 15,                    # seconds between health-probe rounds (TUI)
+        "dns_refresh": 300,                      # seconds before hostnames in route lists are resolved again
+        "notifications": True,                   # desktop notifications (notify-send)
+        "hidden_profiles": [],                   # VPN rows hidden in the TUI list
+        "op_view": "inline",                     # inline (progress in the row) | popup (live log dialog)
     }
 
 
@@ -305,7 +310,8 @@ class Say:
 # ======================================================================================
 def default_config(name: str, kind: str) -> Dict[str, Any]:
     return {"name": name, "kind": kind, "nm_uuid": "", "nm_name": "", "routes": [], "gateway": "auto",
-            "autostart": False, "never_default": True, "ssh_remote": "", "ssh_args": "", "note": ""}
+            "autostart": False, "never_default": True, "ssh_remote": "", "ssh_args": "", "note": "",
+            "probes": [], "notify": True}
 
 
 @dataclass
@@ -367,6 +373,8 @@ def norm_entry(tok: str) -> Optional[str]:
     tok = str(tok).strip()
     if not tok:
         return None
+    if is_host(tok):
+        return tok.lower().rstrip(".")
     b = _range_bounds(tok)
     if b:
         lo, hi = b
@@ -378,36 +386,110 @@ def norm_entry(tok: str) -> Optional[str]:
 
 
 def is_range(entry: str) -> bool:
-    return "-" in entry
+    return bool(re.fullmatch(r"[\d.]+-[\d.]+", entry or ""))
 
 
-def expand_entry(entry: str) -> List[str]:
-    """route entry -> the minimal list of CIDR prefixes the kernel gets"""
+HOST_RX = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9_-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9_-]{1,63}(?<!-))+$")
+
+
+def is_host(entry: str) -> bool:
+    e = (entry or "").rstrip(".")
+    if re.fullmatch(r"[\d.*/-]+", e):   # IPs, CIDRs, ranges, wildcards: never a hostname
+        return False
+    return bool(HOST_RX.match(e)) and not re.search(r"\.\d+$", e)
+
+
+# ---------------------------------------------------------------- hostname resolution (cached)
+DNS_CACHE_FILE = STATE / "dns-cache.json"
+_dns_lock = threading.Lock()
+_dns: Dict[str, Dict[str, Any]] = {}
+
+
+def _dns_load() -> None:
+    global _dns
+    if not _dns:
+        try:
+            _dns = json.loads(DNS_CACHE_FILE.read_text())
+        except (OSError, ValueError):
+            _dns = {}
+
+
+def resolve_host(host: str, max_age: Optional[float] = None, timeout: float = 5) -> Tuple[List[str], str]:
+    """IPv4 addresses of host (cached for settings.dns_refresh seconds). Returns (ips, error)."""
+    host = host.lower().rstrip(".")
+    with _dns_lock:
+        _dns_load()
+        ent = _dns.get(host)
+    if max_age is None:
+        max_age = float(load_settings().get("dns_refresh", 300))
+    if ent and now() - ent.get("ts", 0) < max_age and ent.get("ips"):
+        return list(ent["ips"]), ""
+    box_: Dict[str, Any] = {}
+
+    def look() -> None:
+        try:
+            box_["ips"] = sorted({a[4][0] for a in socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)},
+                                 key=lambda x: tuple(int(p) for p in x.split(".")))
+        except OSError as e:
+            box_["err"] = str(e)
+    th = threading.Thread(target=look, daemon=True)
+    th.start()
+    th.join(timeout)
+    ips, err = box_.get("ips", []), box_.get("err", "" if box_ else "DNS lookup timed out")
+    with _dns_lock:
+        if ips:
+            _dns[host] = {"ips": ips, "ts": now()}
+            try:
+                atomic_write(DNS_CACHE_FILE, json.dumps(_dns, indent=1))
+            except OSError:
+                pass
+        elif ent and ent.get("ips"):
+            return list(ent["ips"]), "lookup failed (%s) — using last known IPs" % err
+    return ips, err
+
+
+def cached_host(host: str) -> List[str]:
+    with _dns_lock:
+        _dns_load()
+        return list((_dns.get(host.lower().rstrip(".")) or {}).get("ips", []))
+
+
+def expand_entry(entry: str, resolve: bool = True) -> List[str]:
+    """route entry -> the minimal list of CIDR prefixes the kernel gets.
+    Hostnames resolve to /32s (resolve=False: use the cache only, never touch the network)."""
     n = norm_entry(entry)
     if not n:
         return []
+    if is_host(n):
+        ips = resolve_host(n)[0] if resolve else cached_host(n)
+        return ["%s/32" % ip for ip in ips]
     if not is_range(n):
         return [n]
     lo, hi = (ipaddress.IPv4Address(x) for x in n.split("-"))
     return [str(x) for x in ipaddress.summarize_address_range(lo, hi)]
 
 
-def expand_routes(entries: List[str]) -> List[str]:
+def expand_routes(entries: List[str], resolve: bool = False) -> List[str]:
+    """all kernel prefixes of a route list. resolve=False (default) uses the DNS cache for hostnames: no network."""
     out: List[str] = []
     for e in entries or []:
-        out += expand_entry(str(e))
+        out += expand_entry(str(e), resolve)
     return list(dict.fromkeys(out))
 
 
 def route_sources(entries: List[str]) -> Dict[str, str]:
-    """expanded CIDR -> the entry it came from (for ranges)"""
+    """expanded CIDR -> the range / hostname entry it came from"""
     res = {}
     for e in entries or []:
         n = norm_entry(str(e))
-        if n and is_range(n):
-            for x in expand_entry(n):
+        if n and (is_range(n) or is_host(n)):
+            for x in expand_entry(n, resolve=False):
                 res.setdefault(x, n)
     return res
+
+
+def host_entries(entries: List[str]) -> List[str]:
+    return [n for n in (norm_entry(str(e)) for e in entries or []) if n and is_host(n)]
 
 
 def entry_label(entry: str) -> str:
@@ -416,6 +498,9 @@ def entry_label(entry: str) -> str:
     if is_range(n):
         lo, hi = (ipaddress.IPv4Address(x) for x in n.split("-"))
         return "%s – %s (%d IPs)" % (lo, hi, int(hi) - int(lo) + 1)
+    if is_host(n):
+        ips = cached_host(n)
+        return "%s (%s)" % (n, ("%d IP%s" % (len(ips), "" if len(ips) == 1 else "s")) if ips else "not resolved yet")
     return short_route(n)
 
 
@@ -451,8 +536,10 @@ def validate_config(c: Dict[str, Any], others: Optional[List[Dict[str, Any]]] = 
     for r in routes:
         n = norm_entry(str(r))
         if not n:
-            iss.append(Issue("error", "invalid IP / CIDR / range %r (ranges: a.b.c.d-e.f.g.h, a.b.c.d-N, a.b.c.*)" % r, "routes"))
+            iss.append(Issue("error", "invalid entry %r (IP, CIDR, a.b.c.d-e.f.g.h, a.b.c.d-N, a.b.c.*, or a hostname)" % r, "routes"))
             continue
+        if is_host(n):
+            continue   # resolved when routes are applied (and re-resolved every dns_refresh seconds)
         exp = expand_entry(n)
         if any(x.endswith("/0") for x in exp):
             iss.append(Issue("error", "%s would replace the default route (not a split tunnel)" % r, "routes"))
@@ -463,6 +550,9 @@ def validate_config(c: Dict[str, Any], others: Optional[List[Dict[str, Any]]] = 
         iss.append(Issue("warn", "%d kernel routes after expanding ranges — that is a lot" % total, "routes"))
     if not routes:
         iss.append(Issue("warn", "no routes: the tunnel will come up but nothing is sent through it", "routes"))
+    for t in c.get("probes") or []:
+        if not parse_probe(str(t)):
+            iss.append(Issue("error", "invalid probe %r (host:port · http(s)://url · ping:host)" % t, "probes"))
     gw = str(c.get("gateway") or "auto")
     if gw != "auto":
         try:
@@ -541,7 +631,8 @@ def state_path(name: str) -> Path:
 
 def load_state(name: str) -> Dict[str, Any]:
     try:
-        return json.loads(state_path(name).read_text())
+        d = json.loads(state_path(name).read_text())
+        return d if isinstance(d, dict) else {}
     except (OSError, ValueError):
         return {}
 
@@ -998,7 +1089,8 @@ class RouteHealth:
     via: str
     ok: bool
     note: str = ""
-    src: str = ""        # the range entry this prefix came from ('' for plain IP/CIDR)
+    src: str = ""        # the range / hostname entry this prefix came from ('' for plain IP/CIDR)
+    owner: str = ""      # another of OUR VPNs that currently owns this shared prefix
 
 
 @dataclass
@@ -1008,7 +1100,7 @@ class VpnStatus:
     display: str
     configured: bool
     profile_ok: bool = True
-    state: str = "down"          # up | down | activating | partial | missing
+    state: str = "down"          # up | degraded | partial | activating | down | missing
     iface: str = ""
     local_ip: str = ""
     gw: str = ""
@@ -1022,10 +1114,49 @@ class VpnStatus:
     message: str = ""
     nm: Optional[NMProfile] = None
     cfg: Optional[Dict[str, Any]] = None
+    probes: List["ProbeResult"] = field(default_factory=list)
 
     @property
     def routes_ok(self) -> int:
         return sum(1 for r in self.routes if r.ok)
+
+    @property
+    def routes_bad(self) -> int:
+        """not through this VPN and not owned by another of our VPNs either"""
+        return sum(1 for r in self.routes if not r.ok and not r.owner)
+
+
+UP_STATES = ("up", "partial", "degraded")
+
+
+def _ownership_and_health(out: List[VpnStatus]) -> None:
+    """shared prefixes: mark which of our VPNs owns them; then partial (routes lost) / degraded (probes failing)"""
+    iface_owner = {s.iface: s.name for s in out if s.iface and s.state == "up"}
+    ssh_up = {s.name for s in out if s.kind == "sshuttle" and s.state == "up"}
+    claims: Dict[str, set] = collections.defaultdict(set)
+    for s in out:
+        for r in expand_routes((s.cfg or {}).get("routes", [])):
+            claims[r].add(s.name)
+    for s in out:
+        for r in s.routes:
+            others = claims.get(r.dst, set()) - {s.name}
+            if not others:
+                continue
+            sh_owner = next((o for o in others if o in ssh_up), None)
+            if sh_owner and s.kind != "sshuttle":      # sshuttle intercepts with iptables before routing applies
+                r.ok, r.owner, r.note = False, sh_owner, "○ shared — sshuttle '%s' intercepts it" % sh_owner
+            elif not r.ok and iface_owner.get(r.dev) in others:
+                r.owner = iface_owner[r.dev]
+                r.note = "○ shared — '%s' owns it now" % r.owner
+    pint = float(load_settings().get("probe_interval", 15))
+    for s in out:
+        if s.state == "up" and s.kind != "sshuttle" and s.routes and s.routes_bad:
+            s.state = "partial"
+        if s.state in UP_STATES and s.cfg and s.cfg.get("probes"):
+            want = set(s.cfg["probes"])
+            s.probes = [x for x in load_probe_results(s.name) if x.target in want and now() - x.ts < max(90, 4 * pint)]
+            if s.state == "up" and any(not x.ok for x in s.probes):
+                s.state = "degraded"
 
 
 def find_tunnel_iface(uuid: str, ifs: Optional[Dict[str, Iface]] = None) -> Tuple[str, str, str]:
@@ -1054,7 +1185,7 @@ def collect_status(with_routes: bool = True, profiles: Optional[List[NMProfile]]
     for c in configs:
         st = load_state(c["name"])
         s = VpnStatus(name=c["name"], kind=c["kind"], display=c.get("nm_name") or c["name"], configured=True,
-                      autostart=bool(c.get("autostart")), cfg=c)
+                      autostart=autostart_enabled(c["name"]) if shutil.which("systemctl") else bool(c.get("autostart")), cfg=c)
         if c.get("broken"):
             s.state, s.message = "missing", "config file is not valid JSON"
             out.append(s)
@@ -1096,9 +1227,8 @@ def collect_status(with_routes: bool = True, profiles: Optional[List[NMProfile]]
                 if s.state == "up" and not ok:
                     note = "goes via %s%s instead" % (dev or "?", (" (" + via + ")") if via else "")
                 s.routes.append(RouteHealth(r, dev, via, ok, note, srcs.get(r, "")))
-            if s.state == "up" and c["kind"] != "sshuttle" and s.routes and s.routes_ok < len(s.routes):
-                s.state = "partial"
         out.append(s)
+    _ownership_and_health(out)
     for p in profiles:
         if p.uuid in used:
             continue
@@ -1158,7 +1288,7 @@ def clean_exclusions(routes: List[str], settings: Dict[str, Any], say: Say, keep
 
 def apply_routes(c: Dict[str, Any], iface: str, gw: str, settings: Dict[str, Any], say: Say) -> Dict[str, Any]:
     """add our split-tunnel routes; returns the state record of what we added"""
-    routes = expand_routes(c.get("routes", []))
+    routes = resolve_for_apply(c, say)
     clean_exclusions(routes, settings, say, keep_dev=iface)
     rc, _, err = priv([IP, "-4", "route", "del", "default", "dev", iface])
     if rc == 0:
@@ -1191,6 +1321,17 @@ def apply_routes(c: Dict[str, Any], iface: str, gw: str, settings: Dict[str, Any
     return {"routes": added, "rules": rules}
 
 
+def resolve_for_apply(c: Dict[str, Any], say: Say) -> List[str]:
+    """expand the route list for the kernel; hostnames are looked up fresh (falls back to the last known IPs)"""
+    for h in host_entries(c.get("routes", [])):
+        ips, err = resolve_host(h, max_age=0)
+        if ips:
+            say("%s → %s%s" % (h, ", ".join(ips), ("  (" + err + ")") if err else ""), "WARN" if err else "INFO")
+        else:
+            say("%s does not resolve (%s) — skipped" % (h, err), "WARN")
+    return expand_routes(c.get("routes", []), resolve=False)
+
+
 def remove_routes(name: str, say: Say) -> None:
     st = load_state(name)
     n = 0
@@ -1211,12 +1352,11 @@ def handoff(dsts: set, leaving: str, say: Say) -> None:
     if not dsts:
         return
     ifs = interfaces()
-    for p in sorted(STATE.glob("*.json")):
-        other = p.stem
+    for other in sorted(c["name"] for c in load_configs()):   # only real VPN state files (not probes / dns cache)
         if other == leaving:
             continue
         ost = load_state(other)
-        if not ost.get("iface") or ost["iface"] not in ifs:
+        if not isinstance(ost, dict) or not ost.get("iface") or ost["iface"] not in ifs:
             continue
         back = 0
         for r in ost.get("routes", []):
@@ -1259,9 +1399,11 @@ def connect(c: Dict[str, Any], settings: Dict[str, Any], out: Optional[Callable[
         for i in iss:
             say("config: %s" % i.msg, "ERROR")
         return False
-    if c["kind"] == "sshuttle":
-        return _connect_sshuttle(c, settings, say)
-    return _connect_nm(c, settings, say)
+    ok = _connect_sshuttle(c, settings, say) if c["kind"] == "sshuttle" else _connect_nm(c, settings, say)
+    st = load_state(c["name"])
+    event(c["name"], "up" if ok else "fail", ("up · %s · %d route(s)" % (st.get("iface") or ("pid %s" % st.get("pid")), len(st.get("routes", [])) or
+                                                                  len(expand_routes(c.get("routes", []))))) if ok else "connect failed (see log)")
+    return ok
 
 
 def _nm_ref(c: Dict[str, Any]) -> List[str]:
@@ -1331,7 +1473,7 @@ def _connect_sshuttle(c: Dict[str, Any], settings: Dict[str, Any], say: Say) -> 
     if pid_alive(st.get("pid"), "sshuttle"):
         say("already running (pid %s)" % st["pid"])
         return True
-    routes = expand_routes(c.get("routes", []))
+    routes = resolve_for_apply(c, say)
     clean_exclusions(routes, settings, say)
     cmd = [exe, "-r", c["ssh_remote"]] + shlex.split(c.get("ssh_args", "")) + routes
     say("starting: %s" % " ".join(shlex.quote(x) for x in cmd[:4]) + (" … (%d routes)" % len(routes)))
@@ -1341,7 +1483,7 @@ def _connect_sshuttle(c: Dict[str, Any], settings: Dict[str, Any], say: Say) -> 
     with lf.open("a") as fh:
         proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
                                 env=dict(os.environ, SSH_ASKPASS_REQUIRE="never"))
-    save_state(c["name"], {"pid": proc.pid, "since": now(), "routes": [], "rules": []})
+    save_state(c["name"], {"pid": proc.pid, "since": now(), "routes": [], "rules": [], "ssh_routes": routes})
     deadline = time.time() + int(settings.get("connect_timeout", 40))
     while time.time() < deadline:
         time.sleep(0.5)
@@ -1367,6 +1509,11 @@ def _connect_sshuttle(c: Dict[str, Any], settings: Dict[str, Any], say: Say) -> 
 
 
 def disconnect(c: Dict[str, Any], settings: Dict[str, Any], out: Optional[Callable[[str], None]] = None) -> bool:
+    event(c["name"], "down", "stopped by you")
+    return _disconnect(c, settings, out)
+
+
+def _disconnect(c: Dict[str, Any], settings: Dict[str, Any], out: Optional[Callable[[str], None]] = None) -> bool:
     say = Say(c["name"], out)
     say("=== down %s ===" % c["name"])
     st = load_state(c["name"])
@@ -1404,6 +1551,29 @@ def disconnect(c: Dict[str, Any], settings: Dict[str, Any], out: Optional[Callab
             priv([IP, "link", "delete", st["iface"]])
     clear_state(c["name"])
     return True
+
+
+def dns_changed(c: Dict[str, Any]) -> Optional[Tuple[set, set]]:
+    """hostnames in the route list re-resolved (respecting dns_refresh). Returns (applied, wanted) if they differ."""
+    hosts = host_entries(c.get("routes", []))
+    st = load_state(c["name"])
+    if not hosts or not st:
+        return None
+    for h in hosts:
+        resolve_host(h)
+    applied = set(st.get("ssh_routes") or [r["dst"] for r in st.get("routes", [])])
+    wanted = set(expand_routes(c.get("routes", [])))
+    return (applied, wanted) if applied != wanted and wanted else None
+
+
+def probe_round(statuses: List[VpnStatus], timeout: float = 4) -> Dict[str, List[ProbeResult]]:
+    """run the health probes of every VPN that is up; results are saved to state/<vpn>.probes.json"""
+    out: Dict[str, List[ProbeResult]] = {}
+    for s in statuses:
+        if s.cfg and s.cfg.get("probes") and s.state in UP_STATES:
+            out[s.name] = run_probes(list(s.cfg["probes"]), timeout)
+            save_probe_results(s.name, out[s.name])
+    return out
 
 
 def connect_with_retries(c: Dict[str, Any], settings: Dict[str, Any], retries: int, out: Optional[Callable[[str], None]] = None) -> bool:
@@ -1608,6 +1778,235 @@ FLAG_TEXT = {0: "saved in profile", 1: "desktop keyring", 2: "always ask", 4: "n
 
 
 # ======================================================================================
+# 9b. health probes · events · notifications · export / import
+# ======================================================================================
+def parse_probe(t: str) -> Optional[Tuple[str, str, int, str]]:
+    """'host:port' | 'tcp:host:port' -> tcp · 'http(s)://…' -> http · 'ping:host' | bare IP/host -> ping.
+    Returns (kind, host, port, url) or None."""
+    t = (t or "").strip()
+    if not t:
+        return None
+    if re.match(r"https?://", t, re.I):
+        from urllib.parse import urlparse
+        u = urlparse(t)
+        if not u.hostname:
+            return None
+        return "http", u.hostname, u.port or (443 if u.scheme.lower() == "https" else 80), t
+    if t.lower().startswith("ping:"):
+        h = t[5:].strip()
+        return ("ping", h, 0, "") if h and (is_host(h) or _is_ip(h)) else None
+    if t.lower().startswith("tcp:"):
+        t = t[4:]
+    m = re.fullmatch(r"\[?([A-Za-z0-9_.-]+)\]?:(\d{1,5})", t)
+    if m and 0 < int(m.group(2)) < 65536 and (is_host(m.group(1)) or _is_ip(m.group(1))):
+        return "tcp", m.group(1), int(m.group(2)), ""
+    if is_host(t) or _is_ip(t):
+        return "ping", t, 0, ""
+    return None
+
+
+def _is_ip(x: str) -> bool:
+    try:
+        ipaddress.IPv4Address(x)
+        return True
+    except ValueError:
+        return False
+
+
+@dataclass
+class ProbeResult:
+    target: str
+    kind: str
+    ok: bool
+    ms: Optional[float] = None
+    detail: str = ""
+    ts: float = 0.0
+
+
+def run_probe(target: str, timeout: float = 4) -> ProbeResult:
+    pp = parse_probe(target)
+    if not pp:
+        return ProbeResult(target, "?", False, None, "invalid probe", now())
+    kind, host, port, url = pp
+    t0 = time.monotonic()
+    if kind == "tcp":
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                pass
+            return ProbeResult(target, kind, True, (time.monotonic() - t0) * 1000, "TCP open", now())
+        except OSError as e:
+            return ProbeResult(target, kind, False, None, (e.strerror or str(e))[:80], now())
+    if kind == "http":
+        import ssl
+        import urllib.error
+        import urllib.request
+        ctx = ssl.create_default_context()
+        ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE   # internal services often use self-signed certs
+        req = urllib.request.Request(url, method="GET", headers={"User-Agent": "multi-vpn-manager-probe"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+                code = r.status
+        except urllib.error.HTTPError as e:
+            code = e.code
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            reason = getattr(e, "reason", e)
+            return ProbeResult(target, kind, False, None, str(reason)[:80], now())
+        ms = (time.monotonic() - t0) * 1000
+        return ProbeResult(target, kind, code < 500, ms, "HTTP %d" % code, now())
+    ms = ping(host, timeout=max(1, int(timeout)))
+    return ProbeResult(target, kind, ms is not None, ms, "ping %s" % ("%.0f ms" % ms if ms is not None else "no reply"), now())
+
+
+def run_probes(targets: List[str], timeout: float = 4) -> List[ProbeResult]:
+    res: List[Optional[ProbeResult]] = [None] * len(targets)
+
+    def one(i: int, t: str) -> None:
+        res[i] = run_probe(t, timeout)
+    ths = [threading.Thread(target=one, args=(i, t), daemon=True) for i, t in enumerate(targets)]
+    for th in ths:
+        th.start()
+    for th in ths:
+        th.join(timeout + 3)
+    return [r or ProbeResult(t, "?", False, None, "timed out", now()) for r, t in zip(res, targets)]
+
+
+def probe_path(name: str) -> Path:
+    return STATE / ("%s.probes.json" % name)
+
+
+def save_probe_results(name: str, results: List[ProbeResult]) -> None:
+    try:
+        atomic_write(probe_path(name), json.dumps([r.__dict__ for r in results], indent=1))
+    except OSError:
+        pass
+
+
+def load_probe_results(name: str) -> List[ProbeResult]:
+    try:
+        return [ProbeResult(**d) for d in json.loads(probe_path(name).read_text())]
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+# ---------------------------------------------------------------- event timeline
+EVENTS_FILE = STATE / "events.jsonl"
+EVENT_ICON = {"up": ("▲", C_GREEN), "down": ("▼", C_MUTED), "fail": ("✖", C_RED), "dropped": ("▼", C_RED), "routes": ("⇢", C_CYAN),
+              "lost": ("⚠", C_ORANGE), "recovered": ("✔", C_GREEN), "probe": ("◍", C_ORANGE), "dns": ("⌂", C_BLUE),
+              "config": ("✎", C_PURPLE), "info": ("•", C_BLUE)}
+
+
+def event(vpn: str, kind: str, msg: str) -> None:
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        with _log_lock:
+            with EVENTS_FILE.open("a") as f:
+                f.write(json.dumps({"ts": now(), "vpn": vpn, "kind": kind, "msg": msg}) + "\n")
+            if EVENTS_FILE.stat().st_size > 400_000:   # keep the newest ~half
+                lines = EVENTS_FILE.read_text().splitlines()
+                atomic_write(EVENTS_FILE, "\n".join(lines[len(lines) // 2:]) + "\n")
+    except OSError:
+        pass
+
+
+def load_events(vpn: Optional[str] = None, n: int = 30) -> List[Dict[str, Any]]:
+    out = []
+    for l in tail_file(EVENTS_FILE, 3000):
+        try:
+            e = json.loads(l)
+        except ValueError:
+            continue
+        if vpn is None or e.get("vpn") == vpn:
+            out.append(e)
+    return out[-n:]
+
+
+def human_ago(ts: Optional[float]) -> str:
+    if not ts:
+        return "-"
+    d = now() - ts
+    if d < 60:
+        return "%ds ago" % d
+    if d < 3600:
+        return "%dm ago" % (d // 60)
+    if d < 86400:
+        return "%dh ago" % (d // 3600)
+    return dt.datetime.fromtimestamp(ts).strftime("%b %d %H:%M")
+
+
+# ---------------------------------------------------------------- desktop notifications
+def desktop_notify(title: str, body: str, urgency: str = "normal", vpn: Optional[str] = None) -> bool:
+    """notify-send, if enabled globally and for this VPN"""
+    if not load_settings().get("notifications", True) or not shutil.which("notify-send"):
+        return False
+    if vpn:
+        c = find_config(vpn)
+        if c is not None and not c.get("notify", True):
+            return False
+    cmd = ["notify-send", "-a", "Multi-VPN Manager", "-u", urgency]
+    icon = BASE / "mvm.svg"
+    if icon.exists():
+        cmd += ["-i", str(icon)]
+    return sh(cmd + [title, body], timeout=5)[0] == 0
+
+
+# ---------------------------------------------------------------- export / import
+EXPORT_FORMAT = "multi-vpn-manager/1"
+
+
+def export_bundle(names: Optional[List[str]] = None, strip_routes: bool = False, strip_hosts: bool = False) -> Dict[str, Any]:
+    """configs only — never secrets (they live in NetworkManager). Machine-specific fields are dropped."""
+    vpns = []
+    for c in load_configs():
+        if c.get("broken") or (names and c["name"] not in names):
+            continue
+        e = {k: v for k, v in c.items() if k not in ("nm_uuid", "autostart", "broken")}
+        if strip_routes:
+            e["routes"], e["probes"] = [], []
+        if strip_hosts:
+            e["ssh_remote"], e["probes"] = "", []
+            e["routes"] = [r for r in e.get("routes", []) if not is_host(str(r))]
+        vpns.append(e)
+    return {"format": EXPORT_FORMAT, "exported": dt.datetime.now().isoformat(timespec="seconds"), "version": VERSION,
+            "stripped": {"routes": strip_routes, "hosts": strip_hosts}, "vpns": vpns}
+
+
+def import_bundle(data: Dict[str, Any], overwrite: bool = False) -> List[Tuple[str, str]]:
+    """returns [(name, what happened)]; links NM VPNs to local GUI profiles by name"""
+    if not isinstance(data, dict) or data.get("format") != EXPORT_FORMAT or not isinstance(data.get("vpns"), list):
+        raise ValueError("not a multi-vpn-manager export (format %r)" % (data.get("format") if isinstance(data, dict) else None))
+    profs = {p.name: p for p in nm_profiles(details=False)}
+    existing = {c["name"] for c in load_configs()}
+    res = []
+    for e in data["vpns"]:
+        if not isinstance(e, dict) or not e.get("name") or e.get("kind") not in KINDS:
+            res.append((str(e.get("name") if isinstance(e, dict) else "?"), "skipped: invalid entry"))
+            continue
+        name = slug(str(e["name"]))
+        if name in existing and not overwrite:
+            res.append((name, "skipped: already exists (use overwrite)"))
+            continue
+        c = default_config(name, e["kind"])
+        c.update({k: v for k, v in e.items() if k in c and k not in ("nm_uuid", "autostart")})
+        c["name"] = name
+        note = ""
+        if c["kind"] != "sshuttle":
+            p = profs.get(c.get("nm_name", ""))
+            if p:
+                c["nm_uuid"] = p.uuid
+                note = "linked to GUI profile '%s'" % p.name
+            else:
+                note = "GUI profile '%s' not on this machine — import the VPN in NetworkManager, then it links by name" % c.get("nm_name")
+        errs = [i.msg for i in validate_config(c) if i.level == "error" and i.where != "nm"]
+        if errs:
+            res.append((name, "skipped: " + errs[0]))
+            continue
+        save_config(c)
+        event(name, "config", "imported from bundle")
+        res.append((name, ("replaced" if name in existing else "imported") + ("; " + note if note else "")))
+    return res
+
+
+# ======================================================================================
 # 10. doctor (troubleshooting)
 # ======================================================================================
 @dataclass
@@ -1798,7 +2197,7 @@ def run_doctor(settings: Dict[str, Any], only: Optional[str] = None, deep: bool 
                         "" if ms is not None else "UDP 500/4500/1701 can't be probed; ping may be filtered")
         # runtime
         if s:
-            if s.state in ("up", "partial"):
+            if s.state in UP_STATES:
                 add(g, "tunnel", "ok", "%s up since %s%s" % (s.iface or ("pid %s" % s.pid), human_dur(now() - s.since) if s.since else "?",
                                                               (" · gw " + s.gw) if s.gw else ""))
                 if c["kind"] != "sshuttle":
@@ -1819,6 +2218,17 @@ def run_doctor(settings: Dict[str, Any], only: Optional[str] = None, deep: bool 
                 add(g, "tunnel", "warn", "NetworkManager is still activating it")
             else:
                 add(g, "tunnel", "info", "down" + (" — " + s.message if s.message else ""))
+        if c.get("probes"):
+            if s and s.state in UP_STATES:
+                for r in run_probes(list(c["probes"])):
+                    add(g, "probe " + r.target, "ok" if r.ok else "fail", "%s%s" % (r.detail, (" · %.0f ms" % r.ms) if r.ms is not None else ""),
+                        "" if r.ok else "tunnel is up but this target does not answer: is the IP routed via this VPN (see routes) / is the service running?")
+            else:
+                add(g, "health probes", "info", "%d configured (run when the VPN is up)" % len(c["probes"]))
+        for h in host_entries(c.get("routes", [])):
+            ips, err = resolve_host(h, max_age=0 if deep else None)
+            add(g, "host " + h, "ok" if ips and not err else ("warn" if ips else "fail"), ", ".join(ips) + (("  " + err) if err else "") if ips else err,
+                "" if ips else "name does not resolve — internal names may need the VPN's DNS; use an IP / CIDR instead")
         errs = journal_lines(c, minutes=30, limit=50, errors_only=True)
         if errs:
             add(g, "recent errors (30 min)", "warn", "%d line(s); last: %s" % (len(errs), errs[-1][-110:]), "see Logs tab")
@@ -1884,7 +2294,7 @@ def spark(values: List[float], width: int = 24):
 
 
 ICON = {"ok": ("✔", C_GREEN), "warn": ("⚠", C_YELLOW), "fail": ("✖", C_RED), "info": ("•", C_BLUE)}
-STATE_STYLE = {"up": ("● UP", C_GREEN), "partial": ("◐ PARTIAL", C_YELLOW), "activating": ("◌ STARTING", C_CYAN),
+STATE_STYLE = {"up": ("● UP", C_GREEN), "partial": ("◐ PARTIAL", C_YELLOW), "degraded": ("◍ DEGRADED", C_ORANGE), "activating": ("◌ STARTING", C_CYAN),
                "down": ("○ down", C_MUTED), "missing": ("✖ MISSING", C_RED)}
 
 
@@ -1963,7 +2373,7 @@ def render_vpn_table(statuses: List[VpnStatus]):
         if not s.configured:
             name.append("  (not managed)", style="italic " + C_MUTED)
         t.add_row(name, KIND_LABEL.get(s.kind, s.kind), state_badge(s.state), s.iface or ("pid %s" % s.pid if s.pid else "-"),
-                  s.gw or "-", r, human_dur(now() - s.since) if s.since and s.state in ("up", "partial") else "-",
+                  s.gw or "-", r, human_dur(now() - s.since) if s.since and s.state in UP_STATES else "-",
                   "↓%s ↑%s" % (human_bytes(s.rx), human_bytes(s.tx)) if s.iface else "-", "✔" if s.autostart else "")
     return t
 
@@ -1986,12 +2396,66 @@ def render_foreign(fs: List[Foreign], compact: bool = False):
     return t
 
 
-def render_vpn_detail(s: VpnStatus, history: Optional[List[float]] = None):
+def route_owners(statuses: List[VpnStatus]) -> Dict[str, str]:
+    """prefix -> which of OUR VPNs carries it right now (sshuttle wins: it intercepts before routing)"""
+    own: Dict[str, str] = {}
+    for s in statuses:
+        for r in s.routes:
+            if r.ok and s.kind != "sshuttle":
+                own[r.dst] = s.name
+    for s in statuses:
+        if s.kind == "sshuttle" and s.state in UP_STATES:
+            for r in s.routes:
+                own[r.dst] = s.name
+    return own
+
+
+def _share_text(dst: str, me: str, claims: Dict[str, List[str]], owners: Dict[str, str]):
+    """'● sabalan owns it · ○ Paystar_ovpn waiting' for prefixes claimed by more than one VPN"""
+    from rich.text import Text
+    names = claims.get(dst, [])
+    t = Text()
+    if len(names) < 2:
+        return t
+    owner = owners.get(dst)
+    t.append("   ")
+    for i, n in enumerate([owner] + [x for x in names if x != owner] if owner in names else names):
+        if i:
+            t.append(" · ", style=C_MUTED)
+        if n == owner:
+            t.append("● %s%s" % ("this VPN" if n == me else n, " owns it"), style="bold " + C_GREEN)
+        else:
+            t.append("○ %s" % ("this VPN" if n == me else n), style=C_YELLOW)
+    if not owner:
+        t.append("  (no owner up)", style=C_MUTED)
+    return t
+
+
+def render_events(events: List[Dict[str, Any]], with_vpn: bool = False, limit: int = 8):
+    from rich.text import Text
+    t = Text()
+    if not events:
+        t.append("no events yet", style=C_MUTED)
+        return t
+    for e in list(reversed(events))[:limit]:
+        ic, col = EVENT_ICON.get(e.get("kind", "info"), EVENT_ICON["info"])
+        t.append("%s " % ic, style="bold " + col)
+        t.append("%-9s " % human_ago(e.get("ts")), style=C_MUTED)
+        if with_vpn:
+            t.append("%-14s " % e.get("vpn", "")[:14], style=C_CYAN)
+        t.append(str(e.get("msg", ""))[:110] + "\n", style=col if e.get("kind") in ("fail", "dropped", "lost", "probe") else C_TEXT)
+    return t
+
+
+def render_vpn_detail(s: VpnStatus, history: Optional[List[float]] = None, lat: Optional[List[float]] = None,
+                      events: Optional[List[Dict[str, Any]]] = None, claims: Optional[Dict[str, List[str]]] = None,
+                      owners: Optional[Dict[str, str]] = None, compact: bool = False):
     from rich import box
     from rich.console import Group
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
+    claims, owners = claims or {}, owners or {}
     head = Text()
     head.append(s.name, style="bold " + C_CYAN)
     head.append("   %s   " % KIND_LABEL.get(s.kind, s.kind), style=C_PURPLE)
@@ -2005,32 +2469,56 @@ def render_vpn_detail(s: VpnStatus, history: Optional[List[float]] = None):
             info.add_row("pid", str(s.pid))
     else:
         info.add_row("GUI profile", s.display + ((" (" + s.nm.uuid[:8] + "…)") if s.nm else ""))
-        if s.nm:
+        if s.nm and not compact:
             info.add_row("user", s.nm.user or "-")
             remote = s.nm.data.get("remote") or s.nm.data.get("gateway") or "-"
             info.add_row("server", nm_unescape(remote))
     info.add_row("interface", s.iface or "-")
-    info.add_row("local IP", s.local_ip or "-")
+    if not compact:
+        info.add_row("local IP", s.local_ip or "-")
     info.add_row("gateway", s.gw or ("(device route)" if s.iface else "-"))
-    info.add_row("up for", human_dur(now() - s.since) if s.since and s.state in ("up", "partial") else "-")
+    info.add_row("up for", human_dur(now() - s.since) if s.since and s.state in UP_STATES else "-")
     if s.iface:
         info.add_row("traffic", "↓ %s   ↑ %s" % (human_bytes(s.rx), human_bytes(s.tx)))
     if history:
         info.add_row("rate", spark(history))
-    if s.cfg:
+    if lat:
+        last = lat[-1]
+        lt = spark([x if x is not None else 0 for x in lat])
+        lt.append("  %s" % ("%.0f ms" % last if last is not None else "no reply"), style=C_TEXT if last is not None else C_RED)
+        info.add_row("latency", lt)
+    if s.cfg and not compact:
         info.add_row("autostart", "on" if s.autostart else "off")
         if s.cfg.get("note"):
             info.add_row("note", s.cfg["note"])
     if s.message:
         info.add_row("note", Text(s.message, style=C_YELLOW))
     parts: List[Any] = [head, Text(""), info]
-    if s.nm and s.nm.secret_flags:
+    # health probes
+    targets = (s.cfg or {}).get("probes") or []
+    if targets:
+        pt = Table(box=box.SIMPLE_HEAD, header_style="bold " + C_BLUE, expand=True)
+        pt.add_column("", width=2)
+        pt.add_column("Probe")
+        pt.add_column("Result")
+        pt.add_column("Latency", justify="right")
+        pt.add_column("Checked", style=C_MUTED)
+        res = {r.target: r for r in s.probes}
+        for t in targets:
+            r = res.get(t)
+            if not r:
+                pt.add_row(Text("·", style=C_MUTED), t, Text("not checked" if s.state in UP_STATES else "VPN down", style=C_MUTED), "", "")
+            else:
+                pt.add_row(Text("✔" if r.ok else "✖", style=C_GREEN if r.ok else C_RED), t, Text(r.detail, style=C_TEXT if r.ok else C_RED),
+                           "%.0f ms" % r.ms if r.ms is not None else "-", human_ago(r.ts))
+        parts += [Text("\nhealth probes", style="bold " + C_PURPLE), pt]
+    if s.nm and s.nm.secret_flags and not compact:
         sec = Text("\ncredentials (from the GUI profile)\n", style="bold " + C_PURPLE)
         for k, f in sorted(s.nm.secret_flags.items()):
             col = C_GREEN if f == 0 else (C_YELLOW if f == 2 else C_CYAN)
             sec.append("  %-26s %s\n" % (SECRET_LABEL.get(k, k), FLAG_TEXT.get(f, str(f))), style=col)
         parts.append(sec)
-    if s.routes or (s.cfg and s.cfg.get("routes")):
+    if not compact and (s.routes or (s.cfg and s.cfg.get("routes"))):
         rt = Table(box=box.SIMPLE_HEAD, header_style="bold " + C_BLUE, expand=True)
         rt.add_column("", width=2)
         rt.add_column("Destination")
@@ -2039,15 +2527,32 @@ def render_vpn_detail(s: VpnStatus, history: Optional[List[float]] = None):
         srcs = route_sources(s.cfg.get("routes", []) if s.cfg else [])
         rows = s.routes or [RouteHealth(r, "", "", False, "", srcs.get(r, "")) for r in expand_routes(s.cfg.get("routes", []))]
         for r in rows:
-            ic = Text("✔", style=C_GREEN) if r.ok else (Text("·", style=C_MUTED) if s.state == "down" else Text("✖", style=C_RED))
-            note = r.note + (("  " if r.note else "") + "⟵ range " + entry_label(r.src) if r.src else "")
+            if r.ok:
+                ic = Text("✔", style=C_GREEN)
+            elif r.owner:
+                ic = Text("○", style=C_YELLOW)
+            elif s.state == "down":
+                ic = Text("·", style=C_MUTED)
+            else:
+                ic = Text("✖", style=C_RED)
+            share = _share_text(r.dst, s.name, claims, owners)
+            note = Text("" if (r.owner and share.plain.strip()) else r.note, style=C_YELLOW if r.owner else C_MUTED)
+            if r.src:
+                note.append(("  " if r.note else "") + ("⟵ " + ("host " if is_host(r.src) else "range ") + entry_label(r.src)), style=C_MUTED)
+            note.append_text(share)
             rt.add_row(ic, short_route(r.dst), "%s%s" % (r.dev or "-", (" → " + r.via) if r.via else ""), note)
+        for h in host_entries((s.cfg or {}).get("routes", [])):
+            if not cached_host(h):
+                rt.add_row(Text("?", style=C_YELLOW), h, "-", Text("not resolved yet (resolves when the VPN comes up)", style=C_YELLOW))
         parts += [Text("\nroutes", style="bold " + C_PURPLE), rt]
-    return Panel(Group(*parts), border_style=C_BLUE if s.state in ("up", "partial") else C_MUTED, box=box.ROUNDED)
+    if events is not None:
+        parts += [Text("\nevents", style="bold " + C_PURPLE), render_events(events, limit=4 if compact else 8)]
+    col = {"up": C_BLUE, "degraded": C_ORANGE, "partial": C_YELLOW}.get(s.state, C_MUTED)
+    return Panel(Group(*parts), border_style=col, box=box.ROUNDED)
 
 
 def render_graph(statuses: List[VpnStatus], fs: List[Foreign]):
-    """VPN -> routes -> where the kernel sends each one right now"""
+    """VPN -> routes -> where the kernel sends each one right now (● owner / ○ waiting for shared prefixes)"""
     from rich.text import Text
     from rich.tree import Tree
     root = Tree(gradient("◆ routing map", bold=True), guide_style=C_MUTED)
@@ -2055,6 +2560,7 @@ def render_graph(statuses: List[VpnStatus], fs: List[Foreign]):
     for s in statuses:
         for r in expand_routes((s.cfg or {}).get("routes", [])):
             claims[r].append(s.name)
+    owners = route_owners(statuses)
     for s in statuses:
         if not s.configured and s.state == "down":
             continue
@@ -2067,22 +2573,26 @@ def render_graph(statuses: List[VpnStatus], fs: List[Foreign]):
             lab.append(" → %s" % (s.gw or "device"), style=C_MUTED)
         if s.kind == "sshuttle" and (s.cfg or {}).get("ssh_remote"):
             lab.append("  ssh %s" % s.cfg["ssh_remote"], style=C_TEXT)
+        if s.probes:
+            okp = sum(1 for p in s.probes if p.ok)
+            lab.append("  ◍ probes %d/%d" % (okp, len(s.probes)), style=C_GREEN if okp == len(s.probes) else C_ORANGE)
         node = root.add(lab)
         srcs = route_sources((s.cfg or {}).get("routes", []))
         rows = s.routes or [RouteHealth(r, "", "", False, "", srcs.get(r, "")) for r in expand_routes((s.cfg or {}).get("routes", []))]
         if not rows and not s.configured:
             node.add(Text("not managed: adopt it to give it routes", style="italic " + C_MUTED))
-        range_nodes: Dict[str, Any] = {}
+        group_nodes: Dict[str, Any] = {}
         for r in rows[:400]:
             parent = node
-            if r.src:   # prefixes of a range hang under one range node
-                if r.src not in range_nodes:
+            if r.src:   # prefixes of a range / hostname hang under one node
+                if r.src not in group_nodes:
                     members = [x for x in rows if x.src == r.src]
                     okc = sum(1 for x in members if x.ok)
                     col = C_MUTED if s.state == "down" else (C_GREEN if okc == len(members) else C_RED if not okc else C_YELLOW)
-                    range_nodes[r.src] = node.add(Text("⇔ range %s  → %d prefix(es)%s" % (entry_label(r.src), len(members),
+                    kind = "⌂ host" if is_host(r.src) else "⇔ range"
+                    group_nodes[r.src] = node.add(Text("%s %s  → %d prefix(es)%s" % (kind, entry_label(r.src), len(members),
                                                        "" if s.state == "down" else "  %d/%d ok" % (okc, len(members))), style="bold " + col))
-                parent = range_nodes[r.src]
+                parent = group_nodes[r.src]
             t = Text()
             if s.state == "down":
                 t.append("· %s" % short_route(r.dst), style=C_MUTED)
@@ -2090,13 +2600,16 @@ def render_graph(statuses: List[VpnStatus], fs: List[Foreign]):
                     t.append("   now via %s" % r.dev, style=C_MUTED)
             elif r.ok:
                 t.append("✔ %s" % short_route(r.dst), style=C_GREEN)
+            elif r.owner:
+                t.append("○ %s" % short_route(r.dst), style=C_YELLOW)
             else:
                 t.append("✖ %s" % short_route(r.dst), style=C_RED)
                 t.append("   %s" % (r.note or "not routed"), style=C_ORANGE)
-            others = [n for n in claims.get(r.dst, []) if n != s.name]
-            if others:
-                t.append("   (also in %s)" % ", ".join(others), style=C_YELLOW)
+            t.append_text(_share_text(r.dst, s.name, claims, owners))
             parent.add(t)
+        for h in host_entries((s.cfg or {}).get("routes", [])):
+            if not cached_host(h):
+                node.add(Text("⌂ host %s  (not resolved yet)" % h, style=C_YELLOW))
     for f in fs:
         lab = Text("◇ %s  %s" % (f.name, f.state), style=C_ORANGE if f.owns_default else (C_GREEN if f.state == "connected" else C_MUTED))
         if f.ifaces:
@@ -2105,6 +2618,8 @@ def render_graph(statuses: List[VpnStatus], fs: List[Foreign]):
     for d in default_routes():
         root.add(Text("⇢ default → %s%s%s" % (d.dev, (" via " + d.via) if d.via else "", "" if d.table in ("main", "") else " (table %s)" % d.table),
                       style=C_BLUE))
+    if any(len(v) > 1 for v in claims.values()):
+        root.add(Text("● = carries the shared IP now · ○ = also claims it, waiting · press p on a VPN to take its shared IPs", style="italic " + C_MUTED))
     return root
 
 
@@ -2112,7 +2627,7 @@ def render_banner(statuses: List[VpnStatus], fs: List[Foreign]):
     from rich.text import Text
     t = Text()
     t.append_text(gradient("⚙ multi-vpn-manager", bold=True))
-    up = sum(1 for s in statuses if s.state in ("up", "partial"))
+    up = sum(1 for s in statuses if s.state in UP_STATES)
     t.append("   %d up" % up, style="bold " + (C_GREEN if up else C_MUTED))
     t.append(" / %d managed" % sum(1 for s in statuses if s.configured), style=C_MUTED)
     fc = [f for f in fs if f.state == "connected"]
@@ -2181,6 +2696,7 @@ def cli_list(args) -> int:
 
 def cli_status(args) -> int:
     while True:
+        probe_round(collect_status(False))
         sts = collect_status(True)
         fs = detect_foreign(own_ifaces(sts), deep=True)
         if args.json:
@@ -2197,7 +2713,7 @@ def cli_status(args) -> int:
         con.print(render_banner(sts, fs))
         con.print(render_vpn_table(sts))
         for s in sts:
-            if s.state in ("up", "partial") or (args.name and args.name in (s.name, s.display)):
+            if s.state in UP_STATES or (args.name and args.name in (s.name, s.display)):
                 con.print(render_vpn_detail(s))
         con.print(render_foreign(fs))
         if not args.watch:
@@ -2208,6 +2724,9 @@ def cli_status(args) -> int:
 def cli_up(args) -> int:
     c = _need(args.name)
     ok = connect_with_retries(c, load_settings(), args.retries, print)
+    if not sys.stdout.isatty():   # autostart (systemd) or a script: tell the desktop
+        desktop_notify("%s %s" % (c["name"], "connected" if ok else "failed to connect"),
+                       "autostart: %s" % ("routes applied" if ok else "see: mvm logs %s" % c["name"]), "normal" if ok else "critical", c["name"])
     return 0 if ok else 1
 
 
@@ -2236,7 +2755,8 @@ def cli_routes(args) -> int:
     if act == "list":
         for r in c.get("routes", []):
             exp = expand_entry(r)
-            print(entry_label(r) + (("   = " + " ".join(short_route(x) for x in exp)) if is_range(norm_entry(r) or "") else ""))
+            n_ = norm_entry(r) or ""
+            print(entry_label(r) + (("   = " + " ".join(short_route(x) for x in exp)) if is_range(n_) or is_host(n_) else ""))
         print("-- %d entries, %d kernel routes" % (len(c.get("routes", [])), len(expand_routes(c.get("routes", [])))))
         return 0
     if act == "add":
@@ -2433,6 +2953,68 @@ def cli_sudoers(args) -> int:
     return 0 if ok else 1
 
 
+def cli_probes(args) -> int:
+    c = _need(args.name)
+    act = args.action or "list"
+    if act in ("add", "rm"):
+        cur = list(c.get("probes") or [])
+        for t in args.items:
+            if act == "add":
+                if not parse_probe(t):
+                    print("invalid probe %r (host:port · http(s)://url · ping:host)" % t)
+                    return 2
+                if t not in cur:
+                    cur.append(t)
+            elif t in cur:
+                cur.remove(t)
+        c["probes"] = cur
+        save_config(c)
+        print("%s: %d probe(s)" % (c["name"], len(cur)))
+        return 0
+    if act == "run":
+        res = run_probes(list(c.get("probes") or []))
+        save_probe_results(c["name"], res)
+        for r in res:
+            print("%s %-40s %-24s %s" % ("✔" if r.ok else "✖", r.target, r.detail, ("%.0f ms" % r.ms) if r.ms is not None else ""))
+        return 0 if all(r.ok for r in res) else 1
+    for t in c.get("probes") or []:
+        print(t)
+    return 0
+
+
+def cli_export(args) -> int:
+    data = export_bundle(args.names or None, args.strip_routes, args.strip_hosts)
+    out = Path(args.output).expanduser() if args.output else Path("mvm-export-%s.json" % dt.date.today().isoformat())
+    atomic_write(out, json.dumps(data, indent=2) + "\n")
+    print("exported %d VPN config(s) to %s (no secrets%s)" % (len(data["vpns"]), out,
+          ", routes stripped" if args.strip_routes else "") + (", hosts stripped" if args.strip_hosts else ""))
+    return 0
+
+
+def cli_import(args) -> int:
+    try:
+        data = json.loads(Path(args.file).expanduser().read_text())
+        res = import_bundle(data, args.overwrite)
+    except (OSError, ValueError) as e:
+        print("✖ %s" % e)
+        return 1
+    for name, what in res:
+        print("%s %-20s %s" % ("✔" if not what.startswith("skipped") else "·", name, what))
+    return 0
+
+
+def cli_dns(args) -> int:
+    cs = [_need(args.name)] if args.name else load_configs()
+    for c in cs:
+        for h in host_entries(c.get("routes", [])):
+            ips, err = resolve_host(h, max_age=0)
+            print("%-16s %-36s %s%s" % (c["name"], h, ", ".join(ips) or "-", ("  (" + err + ")") if err else ""))
+        ch = dns_changed(c)
+        if ch:
+            print("  %s: IPs changed since the routes were applied (+%d −%d) — run: mvm apply %s" % (c["name"], len(ch[1] - ch[0]), len(ch[0] - ch[1]), c["name"]))
+    return 0
+
+
 def cli_bootstrap(args) -> int:
     return 0 if bootstrap() else 1
 
@@ -2557,11 +3139,15 @@ def make_app():
                     yield Input(value=c.get("gateway", "auto"), id="gw")
                 yield Label("Routes through this VPN  (one IP, CIDR or range per line, # comments ok — only these go through the tunnel)")
                 yield TextArea("\n".join(short_route(r) for r in c.get("routes", [])), id="routes")
-                yield Static(Text("formats: 1.2.3.4   10.0.0.0/24   10.0.0.5-10.0.0.20   10.0.0.5-20   10.1.2.*", style=C_MUTED))
+                yield Static(Text("formats: 1.2.3.4   10.0.0.0/24   10.0.0.5-10.0.0.20   10.0.0.5-20   10.1.2.*   git.example.com", style=C_MUTED))
+                yield Label("Health probes  (space/comma separated: host:port · http(s)://url · ping:host — checked while the VPN is up)")
+                yield Input(value=" ".join(c.get("probes") or []), id="probes", placeholder="192.0.2.22:9000  https://intranet.example/health")
                 with Horizontal(classes="row"):
                     if not ssh:
-                        yield Label("never become default route", classes="inline")
+                        yield Label("never default route", classes="inline")
                         yield Switch(value=bool(c.get("never_default", True)), id="nd")
+                    yield Label("notify", classes="inline")
+                    yield Switch(value=bool(c.get("notify", True)), id="notify")
                     yield Label("note", classes="inline")
                     yield Input(value=c.get("note", ""), id="note")
                 yield Static("", id="issues")
@@ -2580,6 +3166,8 @@ def make_app():
             c["routes"] = good
             c["_bad"] = bad
             c["note"] = self.query_one("#note", Input).value.strip()
+            c["probes"] = [t for t in re.split(r"[\s,]+", self.query_one("#probes", Input).value.strip()) if t]
+            c["notify"] = self.query_one("#notify", Switch).value
             if c["kind"] == "sshuttle":
                 c["ssh_remote"] = self.query_one("#remote", Input).value.strip()
                 c["ssh_args"] = self.query_one("#sargs", Input).value.strip()
@@ -2591,12 +3179,14 @@ def make_app():
         def check(self) -> None:
             v = self.value()
             iss = validate_config(v, self.others)
-            iss += [Issue("error", "not an IP/CIDR: %s" % b, "routes") for b in v["_bad"][:5]]
+            iss += [Issue("error", "not an IP / CIDR / range / hostname: %s" % b, "routes") for b in v["_bad"][:5]]
             if self.is_new and any(o["name"] == v["name"] for o in self.others):
                 iss.append(Issue("error", "a VPN with this name already exists", "name"))
             nr = sum(1 for r in v["routes"] if is_range(r))
-            t = Text("%d entr%s%s → %d kernel route(s)\n" % (len(v["routes"]), "y" if len(v["routes"]) == 1 else "ies",
-                                                         (" (%d range%s)" % (nr, "" if nr == 1 else "s")) if nr else "", len(expand_routes(v["routes"]))), style=C_CYAN)
+            nh = sum(1 for r in v["routes"] if is_host(r))
+            extra = ", ".join(x for x in (("%d range%s" % (nr, "" if nr == 1 else "s")) if nr else "", ("%d hostname%s" % (nh, "" if nh == 1 else "s")) if nh else "") if x)
+            t = Text("%d entr%s%s → %d kernel route(s)%s\n" % (len(v["routes"]), "y" if len(v["routes"]) == 1 else "ies", (" (%s)" % extra) if extra else "",
+                                                           len(expand_routes(v["routes"])), " + hostnames resolved at apply time" if nh else ""), style=C_CYAN)
             t.append_text(render_issues(iss))
             self.query_one("#issues", Static).update(t)
             self.query_one("#save", Button).disabled = any(i.level == "error" for i in iss)
@@ -2694,6 +3284,93 @@ def make_app():
         def key_escape(self) -> None:
             self.dismiss(None)
 
+    class ExportForm(ModalScreen[Optional[Dict[str, Any]]]):
+        def __init__(self, names: List[str]) -> None:
+            super().__init__()
+            self.names = names
+
+        def compose(self) -> ComposeResult:
+            from textual.widgets import SelectionList
+            with Vertical(classes="modal"):
+                yield Static(gradient("Export VPN configs", bold=True))
+                yield Static(Text("A JSON bundle of the configs below. Secrets are never included (they stay in NetworkManager);\n"
+                                  "machine-specific bits (profile UUIDs, autostart) are dropped.", style=C_MUTED), classes="modal-body")
+                yield SelectionList(*[(n, n, True) for n in self.names], id="sel")
+                yield Label("Save to")
+                yield Input(value=str(Path.home() / ("mvm-export-%s.json" % dt.date.today().isoformat())), id="path")
+                with Horizontal(classes="row"):
+                    yield Label("strip routes + probes", classes="inline")
+                    yield Switch(value=False, id="sr")
+                    yield Label("strip ssh hosts / hostnames", classes="inline")
+                    yield Switch(value=False, id="sh")
+                with Horizontal(classes="buttons"):
+                    yield Button("Export", variant="success", id="ok")
+                    yield Button("Cancel", id="cancel")
+
+        @on(Button.Pressed, "#ok")
+        def _ok(self) -> None:
+            from textual.widgets import SelectionList
+            sel = list(self.query_one("#sel", SelectionList).selected)
+            if not sel:
+                self.app.notify("select at least one VPN", severity="warning")
+                return
+            self.dismiss({"names": sel, "path": self.query_one("#path", Input).value.strip(),
+                          "strip_routes": self.query_one("#sr", Switch).value, "strip_hosts": self.query_one("#sh", Switch).value})
+
+        @on(Button.Pressed, "#cancel")
+        def _c(self) -> None:
+            self.dismiss(None)
+
+        def key_escape(self) -> None:
+            self.dismiss(None)
+
+    class ImportForm(ModalScreen[Optional[Dict[str, Any]]]):
+        def compose(self) -> ComposeResult:
+            with Vertical(classes="modal"):
+                yield Static(gradient("Import VPN configs", bold=True))
+                yield Label("Bundle file (made by Export / `mvm export`)")
+                yield Input(value=str(Path.home() / ("mvm-export-%s.json" % dt.date.today().isoformat())), id="path")
+                with Horizontal(classes="row"):
+                    yield Label("overwrite configs with the same name", classes="inline")
+                    yield Switch(value=False, id="ow")
+                yield Static("", id="preview", classes="modal-body")
+                with Horizontal(classes="buttons"):
+                    yield Button("Import", variant="success", id="ok")
+                    yield Button("Cancel", id="cancel")
+
+        def on_mount(self) -> None:
+            self.preview()
+
+        @on(Input.Changed, "#path")
+        def preview(self) -> None:
+            pv = self.query_one("#preview", Static)
+            try:
+                d = json.loads(Path(self.query_one("#path", Input).value.strip()).expanduser().read_text())
+                if d.get("format") != EXPORT_FORMAT:
+                    raise ValueError("not a multi-vpn-manager export")
+                have = {c["name"] for c in load_configs()}
+                t = Text("%d VPN(s), exported %s\n" % (len(d.get("vpns", [])), d.get("exported", "?")), style=C_CYAN)
+                for e in d.get("vpns", [])[:12]:
+                    n = slug(str(e.get("name", "?")))
+                    t.append("  %s %-20s %s%s\n" % ("●" if n in have else "+", n, KIND_LABEL.get(e.get("kind"), e.get("kind")),
+                                                    "  (exists)" if n in have else ""), style=C_YELLOW if n in have else C_TEXT)
+                pv.update(t)
+                self.query_one("#ok", Button).disabled = False
+            except (OSError, ValueError, AttributeError) as e:
+                pv.update(Text(str(e), style=C_RED))
+                self.query_one("#ok", Button).disabled = True
+
+        @on(Button.Pressed, "#ok")
+        def _ok(self) -> None:
+            self.dismiss({"path": self.query_one("#path", Input).value.strip(), "overwrite": self.query_one("#ow", Switch).value})
+
+        @on(Button.Pressed, "#cancel")
+        def _c(self) -> None:
+            self.dismiss(None)
+
+        def key_escape(self) -> None:
+            self.dismiss(None)
+
     # ---------------------------------------------------------------- the app
     class MVMApp(App):
         TITLE = "multi-vpn-manager"
@@ -2718,6 +3395,14 @@ def make_app():
         #vpn-detail { width: 1fr; margin-left: 1; }
         .bar { height: 3; margin-top: 1; }
         .bar Button { margin-right: 1; min-width: 10; }
+        #b-auto { width: 16; }
+        #vpn-filter-row { height: 3; }
+        #vpn-filter { width: 1fr; }
+        #vpn-filter-row Label { margin: 1 1 0 1; }
+        #dash-events { border: round #3b4261; background: #24283b; padding: 0 1; height: auto; margin: 0 1 1 0; }
+        #log-filter { width: 30; }
+        #log-level { width: 22; }
+        SelectionList { height: auto; max-height: 12; background: #1a1b26; border: round #3b4261; }
         Button { min-width: 10; }
         #log-top { height: 3; }
         #log-top Select { width: 40; }
@@ -2762,6 +3447,8 @@ def make_app():
             Binding("n", "new_ssh", "New sshuttle"),
             Binding("o", "autostart", "Autostart"),
             Binding("l", "logs", "Logs"),
+            Binding("v", "view_output", "Output"),
+            Binding("h", "hide", "Hide"),
             Binding("f", "fix", "Fix"),
             Binding("g", "refresh_all", "Refresh"),
         ]
@@ -2779,6 +3466,19 @@ def make_app():
             self.log_name: Optional[str] = None
             self.log_pos = 0
             self._busy = threading.Lock()
+            self.lat: Dict[str, collections.deque] = {}           # gateway / first-probe latency history
+            self.prev_state: Dict[str, str] = {}
+            self.busy: Dict[str, str] = {}                        # vpn -> running inline op ("connecting" ...)
+            self.op_output: Dict[str, List[str]] = {}
+            self.op_result: Dict[str, Optional[bool]] = {}
+            self.op_done: Dict[str, float] = {}
+            self.claims: Dict[str, List[str]] = {}
+            self.owners: Dict[str, str] = {}
+            self.spin_i = 0
+            self.col_state: Any = None
+            self.log_raw: List[Tuple[str, str]] = []              # (line, kind: hdr | own | journal)
+            self.err_offsets: List[int] = []
+            self.err_idx = -1
 
         def q(self, selector: str, expect: Any = None) -> Any:
             """look a widget up on the MAIN screen (self.query_one would search the open dialog instead)"""
@@ -2795,10 +3495,15 @@ def make_app():
                             yield Static("", id="dash-foreign", classes="card")
                             yield Static("", id="dash-health", classes="card")
                         yield Static("", id="dash-table")
+                        yield Static("", id="dash-events")
                         yield Static("", id="dash-cards")
                 with TabPane("▤ VPNs", id="vpns"):
                     with Horizontal():
                         with Vertical(id="vpn-side"):
+                            with Horizontal(id="vpn-filter-row"):
+                                yield Input(placeholder="filter: name · type · state …", id="vpn-filter")
+                                yield Label("hidden")
+                                yield Switch(value=False, id="vpn-showhidden")
                             yield DataTable(id="vpn-table", cursor_type="row", zebra_stripes=True)
                             with Horizontal(classes="bar"):
                                 yield Button("▶ Up", id="b-up", variant="success")
@@ -2824,8 +3529,12 @@ def make_app():
                     with Vertical():
                         with Horizontal(id="log-top"):
                             yield Select([], id="log-vpn", prompt="choose a VPN")
-                            yield Label("journal lines")
+                            yield Input(placeholder="search …", id="log-filter")
+                            yield Select([("all lines", "all"), ("warnings + errors", "warn"), ("errors only", "error")], value="all",
+                                         allow_blank=False, id="log-level")
+                            yield Label("journal")
                             yield Switch(value=True, id="log-journal")
+                            yield Button("Next error", id="log-next", variant="error")
                             yield Button("Reload", id="log-reload", variant="primary")
                         yield RichLog(id="log-view", markup=False, wrap=True, highlight=False, max_lines=5000)
                 with TabPane("✚ Troubleshoot", id="doctor"):
@@ -2854,17 +3563,30 @@ def make_app():
                         yield Label("Colours (applies on next start; 'auto' = true colour unless on a Linux console)")
                         yield Select([("auto", "auto"), ("true colour (24-bit)", "truecolor"), ("256 colours", "256"), ("16 colours", "16")],
                                      value="auto", allow_blank=False, id="set-colors")
-                        yield Static("", id="sudoers-preview")
+                        yield Label("Health probe interval (seconds)")
+                        yield Input(id="set-probe_interval", type="integer")
+                        yield Label("Re-resolve hostnames in route lists every … seconds (changed IPs are re-applied automatically)")
+                        yield Input(id="set-dns_refresh", type="integer")
+                        yield Label("Desktop notifications (drops, lost routes, failing probes, recoveries) — can be turned off per VPN in Edit")
+                        yield Switch(id="set-notifications")
+                        yield Label("Up / down progress")
+                        yield Select([("inline in the VPN row (press v for the output)", "inline"), ("popup with the live log", "popup")],
+                                     value="inline", allow_blank=False, id="set-op_view")
                         with Horizontal(classes="bar"):
                             yield Button("Save settings", id="s-save", variant="success")
                             yield Button("Install sudoers rule", id="s-sudo", variant="warning")
+                            yield Button("Export configs…", id="s-export", variant="primary")
+                            yield Button("Import configs…", id="s-import", variant="primary")
+                        yield Static("", id="sudoers-preview")
             yield Footer()
 
         # ---- lifecycle
         def on_mount(self) -> None:
             t = self.q("#vpn-table", DataTable)
-            for label, w in (("VPN", 20), ("Type", 10), ("State", 11), ("If", 7), ("Routes", 7)):
-                t.add_column(label, width=w)
+            for label, w in (("VPN", 20), ("Type", 10), ("State", 13), ("If", 6), ("Routes", 7)):
+                k = t.add_column(label, width=w)
+                if label == "State":
+                    self.col_state = k
             d = self.q("#doc-table", DataTable)
             for label, w in (("", 2), ("Group", 18), ("Check", 28), ("Result", 64)):
                 d.add_column(label, width=w)
@@ -2873,10 +3595,15 @@ def make_app():
             self.run_doctor_bg(False)
             self.set_interval(max(1, int(self.settings.get("refresh_interval", 3))), self.live_refresh)
             self.set_interval(2.0, self.poll_log)
+            self.set_interval(max(5, int(self.settings.get("probe_interval", 15))), self.probe_refresh)
+            self.set_interval(60, self.dns_watch)
+            self.set_interval(0.25, self.spin)
+            self.set_timer(2.5, self.probe_refresh)
 
         def check_action(self, action: str, parameters: Tuple[Any, ...]) -> Optional[bool]:
             if len(self.screen_stack) > 1:
-                return action not in ("tab", "up", "down", "restart", "apply", "edit", "secrets", "adopt", "new_ssh", "autostart", "logs", "fix") or None
+                return action not in ("tab", "up", "down", "restart", "apply", "edit", "secrets", "adopt", "new_ssh", "autostart", "logs", "fix",
+                                      "hide", "view_output") or None
             if action == "tab" and isinstance(self.focused, (Input, Select, TextArea)):
                 return False
             return True
@@ -2918,6 +3645,12 @@ def make_app():
 
         def apply_live(self, sts: List[VpnStatus], fs: List[Foreign]) -> None:
             self.statuses, self.foreign = sts, fs
+            self.claims = collections.defaultdict(list)
+            for s_ in sts:
+                for r in expand_routes((s_.cfg or {}).get("routes", [])):
+                    self.claims[r].append(s_.name)
+            self.owners = route_owners(sts)
+            self.detect_transitions(sts)
             t0 = time.time()
             for s in sts:
                 tot = s.rx + s.tx
@@ -2932,9 +3665,99 @@ def make_app():
             self.update_log_choices()
             self.update_doc_scope()
 
+        def detect_transitions(self, sts: List[VpnStatus]) -> None:
+            """state changes NOT caused by our own up/down -> event timeline + desktop notification"""
+            for s_ in sts:
+                if not s_.configured:
+                    continue
+                prev = self.prev_state.get(s_.name)
+                self.prev_state[s_.name] = s_.state
+                if prev is None or prev == s_.state or s_.name in self.busy or now() - self.op_done.get(s_.name, 0) < 20:
+                    continue
+                n = s_.name
+                if prev in UP_STATES and s_.state in ("down", "missing"):
+                    event(n, "dropped", "tunnel dropped (%s → %s)" % (prev, s_.state))
+                    desktop_notify("%s dropped" % n, "the tunnel went down — its routes now fall back to your normal connection", "critical", n)
+                elif s_.state == "partial" and prev in ("up", "degraded"):
+                    bad = [short_route(r.dst) for r in s_.routes if not r.ok and not r.owner]
+                    event(n, "lost", "%d route(s) no longer via %s: %s" % (len(bad), s_.iface, ", ".join(bad[:4])))
+                    desktop_notify("%s lost routes" % n, "%d IP(s) no longer go through %s — press p to re-apply" % (len(bad), s_.iface), "normal", n)
+                elif s_.state == "degraded" and prev == "up":
+                    bad = [p_.target for p_ in s_.probes if not p_.ok]
+                    event(n, "probe", "probe failing: %s" % ", ".join(bad[:3]))
+                    desktop_notify("%s: target unreachable" % n, "tunnel is up but %s does not answer" % ", ".join(bad[:3]), "normal", n)
+                elif s_.state == "up" and prev in ("partial", "degraded"):
+                    event(n, "recovered", "healthy again (was %s)" % prev)
+                    desktop_notify("%s recovered" % n, "all routes and probes OK again", "low", n)
+                elif s_.state in UP_STATES and prev in ("down", "activating", "missing"):
+                    event(n, "up", "came up outside mvm (GUI / autostart)")
+
+        @work(thread=True, exclusive=True, group="probes")
+        def probe_refresh(self) -> None:
+            sts = list(self.statuses)
+            try:
+                probe_round(sts)
+                for s_ in sts:
+                    if s_.state not in UP_STATES or not (s_.gw or (s_.cfg or {}).get("probes")):
+                        continue   # nothing to measure (e.g. sshuttle without probes)
+                    ms = ping(s_.gw, 1) if s_.gw else None
+                    if ms is None and s_.cfg and s_.cfg.get("probes"):
+                        pr = next((x for x in load_probe_results(s_.name) if x.ok and x.ms is not None), None)
+                        ms = pr.ms if pr else None
+                    self.lat.setdefault(s_.name, collections.deque(maxlen=40)).append(ms)
+            except Exception as e:  # noqa: BLE001
+                self.call_from_thread(self.notify, "probe error: %r" % e, severity="error")
+            self.call_from_thread(self.live_refresh)
+
+        @work(thread=True, exclusive=True, group="dns")
+        def dns_watch(self) -> None:
+            """hostnames in route lists: re-resolve; if the IPs changed, re-apply the routes of that VPN"""
+            for s_ in list(self.statuses):
+                if not s_.cfg or s_.state not in UP_STATES or s_.name in self.busy or not host_entries(s_.cfg.get("routes", [])):
+                    continue
+                ch = dns_changed(s_.cfg)
+                if not ch:
+                    continue
+                added, gone = len(ch[1] - ch[0]), len(ch[0] - ch[1])
+                if s_.kind == "sshuttle":
+                    event(s_.name, "dns", "hostname IPs changed (+%d −%d) — restart sshuttle to use them" % (added, gone))
+                    desktop_notify("%s: hostname IPs changed" % s_.name, "restart it (t) so sshuttle routes the new IPs", "normal", s_.name)
+                    continue
+                connect(s_.cfg, self.settings, None)
+                event(s_.name, "dns", "hostname IPs changed → routes re-applied (+%d −%d)" % (added, gone))
+                self.op_done[s_.name] = now()
+            self.call_from_thread(self.live_refresh)
+
+        def spin(self) -> None:
+            if not self.busy or self.col_state is None:
+                return
+            self.spin_i += 1
+            t = self.q("#vpn-table", DataTable)
+            for name, what in list(self.busy.items()):
+                try:
+                    t.update_cell(name, self.col_state, Text("%s %s" % ("◐◓◑◒"[self.spin_i % 4], what), style="bold " + C_CYAN))
+                except Exception:  # noqa: BLE001  (row filtered out / not there yet)
+                    pass
+
+        def visible_statuses(self, for_dashboard: bool = False) -> List[VpnStatus]:
+            hidden = set(self.settings.get("hidden_profiles", []))
+            if for_dashboard:
+                return [x for x in self.statuses if x.name not in hidden]
+            show_hidden = self.q("#vpn-showhidden", Switch).value
+            qtxt = self.q("#vpn-filter", Input).value.strip().lower()
+            out = []
+            for x in self.statuses:
+                if x.name in hidden and not show_hidden:
+                    continue
+                hay = " ".join((x.name, x.display, KIND_LABEL.get(x.kind, x.kind), x.state, x.iface, "managed" if x.configured else "unmanaged")).lower()
+                if qtxt and not all(w in hay for w in qtxt.split()):
+                    continue
+                out.append(x)
+            return out
+
         def update_dashboard(self) -> None:
-            sts = self.statuses
-            up = [s for s in sts if s.state in ("up", "partial")]
+            sts = self.visible_statuses(for_dashboard=True)
+            up = [s for s in sts if s.state in UP_STATES]
             v = Text()
             v.append("OUR VPNs\n\n", style="bold " + C_PURPLE)
             v.append("%d" % len(up), style="bold " + (C_GREEN if up else C_MUTED))
@@ -2947,9 +3770,13 @@ def make_app():
             self.q("#dash-foreign", Static).update(render_foreign(self.foreign, compact=True))
             self.update_health()
             self.q("#dash-table", Static).update(render_vpn_table(sts))
+            ev = Text("RECENT EVENTS\n\n", style="bold " + C_PURPLE)
+            ev.append_text(render_events(load_events(None, 40), with_vpn=True, limit=8))
+            self.q("#dash-events", Static).update(ev)
             cards = []
             for s in up:
-                cards.append(render_vpn_detail(s, list(self.hist.get(s.name, []))))
+                cards.append(render_vpn_detail(s, list(self.hist.get(s.name, [])), list(self.lat.get(s.name, [])), load_events(s.name, 10),
+                                               self.claims, self.owners, compact=True))
             self.q("#dash-cards", Static).update(Group(*cards) if cards else Text("\nno managed VPN is up — go to the VPNs tab (2) and press u", style=C_MUTED))
 
         def update_health(self) -> None:
@@ -2970,24 +3797,42 @@ def make_app():
             t = self.q("#vpn-table", DataTable)
             keep = self.sel
             t.clear()
-            for s in self.statuses:
+            vis = self.visible_statuses()
+            hidden = set(self.settings.get("hidden_profiles", []))
+            for s in vis:
                 routes = "%d/%d" % (s.routes_ok, len(s.routes)) if s.routes and s.state != "down" else str(len(expand_routes((s.cfg or {}).get("routes", [])))) if s.cfg else "-"
                 name = Text(s.name, style="bold " + C_CYAN) if s.configured else Text(s.name + " ·", style=C_MUTED)
-                t.add_row(name, KIND_LABEL.get(s.kind, s.kind), state_badge(s.state), s.iface or ("ssh" if s.pid else "-"), routes, key=s.name)
-            if self.statuses:
-                names = [s.name for s in self.statuses]
+                if s.name in hidden:
+                    name = Text(s.name + " (hidden)", style="italic " + C_MUTED)
+                st_cell = Text("%s %s" % ("◐◓◑◒"[self.spin_i % 4], self.busy[s.name]), style="bold " + C_CYAN) if s.name in self.busy else state_badge(s.state)
+                t.add_row(name, KIND_LABEL.get(s.kind, s.kind), st_cell, s.iface or ("ssh" if s.pid else "-"), routes, key=s.name)
+            if vis:
+                names = [s.name for s in vis]
                 idx = names.index(keep) if keep in names else 0
                 t.move_cursor(row=idx)
                 self.sel = names[idx]
             self.update_detail()
 
+        def update_autostart_button(self, s: Optional[VpnStatus] = None) -> None:
+            """red 'Autostart ON' when the selected VPN starts at login, plain 'Autostart' otherwise"""
+            s = s if s is not None else self.cur()
+            b = self.q("#b-auto", Button)
+            on_ = bool(s and s.configured and s.autostart)
+            b.label = "Autostart ON" if on_ else "Autostart"
+            b.variant = "error" if on_ else "default"
+            b.tooltip = ("starts at login — press to disable" if on_ else "press to start this VPN at login") if s and s.configured else "adopt the VPN first"
+
         def update_detail(self) -> None:
             s = self.cur()
+            self.update_autostart_button(s)
             body = self.q("#vpn-detail-body", Static)
             if not s:
                 body.update(Text("no VPNs found. Create one in the GUI (NetworkManager) or add an sshuttle profile (n).", style=C_MUTED))
                 return
-            parts: List[Any] = [render_vpn_detail(s, list(self.hist.get(s.name, [])))]
+            parts: List[Any] = [render_vpn_detail(s, list(self.hist.get(s.name, [])), list(self.lat.get(s.name, [])), load_events(s.name, 20),
+                                                  self.claims, self.owners)]
+            if s.name in self.busy:
+                parts.insert(0, Text("◌ %s … (press v to watch the output)" % self.busy[s.name], style="bold " + C_CYAN))
             if not s.configured:
                 parts.append(Text("\nThis GUI VPN is not managed yet. Press a (Adopt) to give it routes, logs and autostart.", style=C_YELLOW))
             elif s.cfg:
@@ -2998,6 +3843,30 @@ def make_app():
 
         def cur(self) -> Optional[VpnStatus]:
             return next((s for s in self.statuses if s.name == self.sel), None)
+
+        @on(Input.Changed, "#vpn-filter")
+        @on(Switch.Changed, "#vpn-showhidden")
+        def _vfilter(self) -> None:
+            self.update_vpn_table()
+
+        def action_hide(self) -> None:
+            s = self.cur()
+            if not s:
+                return
+            hidden = list(self.settings.get("hidden_profiles", []))
+            if s.name in hidden:
+                hidden.remove(s.name)
+                msg = "%s is visible again" % s.name
+            else:
+                hidden.append(s.name)
+                msg = "hid %s — switch on 'hidden' above the list to see it (h again to unhide)" % s.name
+            self.settings["hidden_profiles"] = hidden
+            st = load_settings()
+            st["hidden_profiles"] = hidden
+            save_settings(st)
+            self.notify(msg, timeout=4)
+            self.update_vpn_table()
+            self.update_dashboard()
 
         @on(DataTable.RowHighlighted, "#vpn-table")
         def _row(self, ev: DataTable.RowHighlighted) -> None:
@@ -3016,23 +3885,71 @@ def make_app():
                 return None
             return s.cfg
 
-        def run_op(self, title: str, job: Callable[[Callable[[str], None]], bool]) -> None:
-            self.push_screen(RunLog(title, job), lambda _: self.live_refresh(True))
+        def run_op(self, title: str, job: Callable[[Callable[[str], None]], bool], name: Optional[str] = None, what: str = "working") -> None:
+            if not name or self.settings.get("op_view", "inline") == "popup":
+                self.push_screen(RunLog(title, job), lambda _: self.live_refresh(True))
+                return
+            if name in self.busy:
+                self.notify("%s is busy (%s) — press v to watch" % (name, self.busy[name]), severity="warning")
+                return
+            self.busy[name] = what
+            self.op_output[name] = []
+            self.op_result[name] = None
+            self.update_vpn_table()
+            out = self.op_output[name]
+
+            def runner() -> None:
+                try:
+                    ok = bool(job(out.append))
+                except Exception as e:  # noqa: BLE001
+                    out.append("✖ internal error: %r" % e)
+                    ok = False
+                self.call_from_thread(self._op_done, name, title, ok)
+            threading.Thread(target=runner, daemon=True).start()
+
+        def _op_done(self, name: str, title: str, ok: bool) -> None:
+            self.busy.pop(name, None)
+            self.op_done[name] = now()
+            self.op_result[name] = ok
+            if ok:
+                self.notify("✔ %s" % title, timeout=4)
+            else:
+                last = next((l for l in reversed(self.op_output.get(name, [])) if l.startswith(("✖", "⚠"))), "")
+                self.notify("✖ %s failed — press v for the output\n%s" % (title, last[:140]), severity="error", timeout=12)
+            self.live_refresh(True)
+
+        def action_view_output(self) -> None:
+            name = self.sel
+            if not name or name not in self.op_output:
+                self.notify("no up/down output for %s yet in this session (see Logs: l)" % (name or "-"), severity="warning")
+                return
+
+            def follow(say: Callable[[str], None]) -> bool:
+                i = 0
+                while True:
+                    lines = self.op_output.get(name, [])
+                    while i < len(lines):
+                        say(lines[i])
+                        i += 1
+                    if name not in self.busy:
+                        return bool(self.op_result.get(name))
+                    time.sleep(0.2)
+            self.push_screen(RunLog("Output: %s" % name, follow))
 
         def action_up(self) -> None:
             c = self._cfg_or_warn()
             if c:
-                self.run_op("Up: %s" % c["name"], lambda say: connect(c, self.settings, say))
+                self.run_op("Up: %s" % c["name"], lambda say: connect(c, self.settings, say), c["name"], "connecting")
 
         def action_down(self) -> None:
             c = self._cfg_or_warn()
             if c:
-                self.run_op("Down: %s" % c["name"], lambda say: disconnect(c, self.settings, say))
+                self.run_op("Down: %s" % c["name"], lambda say: disconnect(c, self.settings, say), c["name"], "stopping")
 
         def action_restart(self) -> None:
             c = self._cfg_or_warn()
             if c:
-                self.run_op("Restart: %s" % c["name"], lambda say: (disconnect(c, self.settings, say), connect(c, self.settings, say))[1])
+                self.run_op("Restart: %s" % c["name"], lambda say: (disconnect(c, self.settings, say), connect(c, self.settings, say))[1], c["name"], "restarting")
 
         def action_apply(self) -> None:
             c = self._cfg_or_warn()
@@ -3042,10 +3959,10 @@ def make_app():
                 self.notify("sshuttle takes its routes at start: use Restart (t)", severity="warning")
                 return
             s = self.cur()
-            if s and s.state not in ("up", "partial"):
+            if s and s.state not in UP_STATES:
                 self.notify("%s is down — Up (u) applies the routes" % c["name"], severity="warning")
                 return
-            self.run_op("Apply routes: %s" % c["name"], lambda say: connect(c, self.settings, say))
+            self.run_op("Apply routes: %s" % c["name"], lambda say: connect(c, self.settings, say), c["name"], "applying")
 
         def action_edit(self) -> None:
             c = self._cfg_or_warn()
@@ -3057,8 +3974,10 @@ def make_app():
                 if v:
                     save_config(v)
                     vlog(v["name"], "config edited (%d routes)" % len(v["routes"]))
+                    event(v["name"], "config", "config edited · %d route entr%s · %d probe(s)" % (len(v["routes"]), "y" if len(v["routes"]) == 1 else "ies",
+                                                                                               len(v.get("probes") or [])))
                     s = self.cur()
-                    self.notify("saved %s%s" % (v["name"], " — press p to apply to the running tunnel" if s and s.state in ("up", "partial") else ""), timeout=4)
+                    self.notify("saved %s%s" % (v["name"], " — press p to apply to the running tunnel" if s and s.state in UP_STATES else ""), timeout=4)
                     self.live_refresh()
             self.push_screen(ConfigForm(c, others), done)
 
@@ -3125,6 +4044,10 @@ def make_app():
             ok, msg = set_autostart(c["name"], on_)
             self.notify(("autostart %s for %s" % ("enabled" if on_ else "disabled", c["name"])) if ok else "✖ " + msg,
                         severity="information" if ok else "error", timeout=5)
+            s = self.cur()
+            if ok and s:
+                s.autostart = on_
+                self.update_autostart_button(s)   # instant feedback, before the next refresh
             self.live_refresh()
 
         def action_logs(self) -> None:
@@ -3158,7 +4081,8 @@ def make_app():
                  "b-auto": self.action_autostart, "b-logs": self.action_logs, "b-del": self.forget,
                  "b-check": lambda: self.check_selected(), "log-reload": lambda: self.load_log(True),
                  "doc-quick": lambda: self.run_doctor_bg(False), "doc-deep": lambda: self.run_doctor_bg(True), "doc-fix": self.action_fix,
-                 "doc-sudo": self.install_sudo, "s-sudo": self.install_sudo, "s-save": self.save_settings_form}
+                 "doc-sudo": self.install_sudo, "s-sudo": self.install_sudo, "s-save": self.save_settings_form,
+                 "s-export": self.export_dialog, "s-import": self.import_dialog, "log-next": self.next_error}
             if bid in m:
                 m[bid]()
 
@@ -3212,20 +4136,70 @@ def make_app():
             self.call_from_thread(self.show_log, name, own, jl, pos)
 
         def show_log(self, name: str, own: List[str], jl: List[str], pos: int) -> None:
+            raw: List[Tuple[str, str]] = [("── %s · own log (%s) ──" % (name, log_path(name)), "hdr")]
+            raw += [(l, "own") for l in own] or [("(empty — the log fills when you use up/down/edit)", "hdr")]
+            if self.q("#log-journal", Switch).value:
+                raw.append(("── system journal: NetworkManager / VPN plugin lines for %s ──" % name, "hdr"))
+                raw += [(l, "journal") for l in jl] or [("(no matching journal lines, or no permission to read the journal)", "hdr")]
+            self.log_raw = raw
+            self.log_pos = pos
+            self.render_log()
+
+        @staticmethod
+        def line_level(l: str) -> str:
+            if " ERROR " in l or (ERR_RX.search(l) and " INFO " not in l and " OK " not in l):
+                return "error"
+            if " WARN " in l or "<warn>" in l:
+                return "warn"
+            return "info"
+
+        def log_passes(self, l: str, kind: str) -> bool:
+            if kind == "hdr":
+                return True
+            lvl = self.q("#log-level", Select).value
+            lv = self.line_level(l)
+            if lvl == "error" and lv != "error" or lvl == "warn" and lv == "info":
+                return False
+            qtxt = self.q("#log-filter", Input).value.strip().lower()
+            return not qtxt or qtxt in l.lower()
+
+        def write_log_line(self, lg: Any, l: str, kind: str) -> None:
+            if kind == "hdr":
+                lg.write(Text(l, style="bold " + C_PURPLE if l.startswith("──") else C_MUTED))
+                return
+            t = self.style_line(l)
+            qtxt = self.q("#log-filter", Input).value.strip()
+            if qtxt:
+                t.highlight_words([qtxt], style="bold #1a1b26 on " + C_YELLOW, case_sensitive=False)
+            if self.line_level(l) == "error":
+                self.err_offsets.append(len(lg.lines))
+            lg.write(t)
+
+        def render_log(self) -> None:
             lg = self.q("#log-view", RichLog)
             lg.clear()
-            lg.write(Text("── %s · own log (%s) ──" % (name, log_path(name)), style="bold " + C_PURPLE))
-            for l in own:
-                lg.write(self.style_line(l))
-            if not own:
-                lg.write(Text("(empty — the log fills when you use up/down/edit)", style=C_MUTED))
-            if self.q("#log-journal", Switch).value:
-                lg.write(Text("── system journal: NetworkManager / VPN plugin lines for %s ──" % name, style="bold " + C_PURPLE))
-                for l in jl:
-                    lg.write(self.style_line(l))
-                if not jl:
-                    lg.write(Text("(no matching journal lines, or no permission to read the journal)", style=C_MUTED))
-            self.log_pos = pos
+            self.err_offsets, self.err_idx = [], -1
+            shown = 0
+            for l, kind in self.log_raw:
+                if self.log_passes(l, kind):
+                    self.write_log_line(lg, l, kind)
+                    shown += kind != "hdr"
+            if shown == 0 and (self.q("#log-filter", Input).value.strip() or self.q("#log-level", Select).value != "all"):
+                lg.write(Text("(no lines match the filter)", style=C_MUTED))
+
+        @on(Input.Changed, "#log-filter")
+        @on(Select.Changed, "#log-level")
+        def _logfilter(self) -> None:
+            if self.log_raw:
+                self.render_log()
+
+        def next_error(self) -> None:
+            if not self.err_offsets:
+                self.notify("no errors in the shown lines", timeout=2)
+                return
+            self.err_idx = (self.err_idx + 1) % len(self.err_offsets)
+            self.q("#log-view", RichLog).scroll_to(y=self.err_offsets[self.err_idx], animate=False)
+            self.notify("error %d / %d" % (self.err_idx + 1, len(self.err_offsets)), timeout=1.5)
 
         def style_line(self, l: str) -> Text:
             if " ERROR " in l or ERR_RX.search(l) and " INFO " not in l:
@@ -3257,7 +4231,9 @@ def make_app():
                     self.log_pos = f.tell()
                 lg = self.q("#log-view", RichLog)
                 for l in new.splitlines():
-                    lg.write(self.style_line(l))
+                    self.log_raw.append((l, "own"))
+                    if self.log_passes(l, "own"):
+                        self.write_log_line(lg, l, "own")
 
         # ---- troubleshoot tab
         def update_doc_scope(self) -> None:
@@ -3356,13 +4332,17 @@ def make_app():
             self.q("#set-clean_tables", Input).value = ", ".join(s.get("clean_tables", []))
             self.q("#set-policy_rules", Switch).value = bool(s.get("policy_rules", True))
             self.q("#set-colors", Select).value = s.get("colors", "auto") if s.get("colors", "auto") in ("auto", "truecolor", "256", "16") else "auto"
+            for k in ("probe_interval", "dns_refresh"):
+                self.q("#set-" + k, Input).value = str(s.get(k, ""))
+            self.q("#set-notifications", Switch).value = bool(s.get("notifications", True))
+            self.q("#set-op_view", Select).value = s.get("op_view", "inline") if s.get("op_view") in ("inline", "popup") else "inline"
             pv = Text("\nsudoers rule that `Install sudoers` writes to %s:\n" % SUDOERS_FILE, style="bold " + C_PURPLE)
             pv.append(sudoers_text(), style=C_MUTED)
             self.q("#sudoers-preview", Static).update(pv)
 
         def save_settings_form(self) -> None:
             s = dict(self.settings)
-            for k in ("refresh_interval", "connect_timeout", "journal_minutes"):
+            for k in ("refresh_interval", "connect_timeout", "journal_minutes", "probe_interval", "dns_refresh"):
                 v = self.q("#set-" + k, Input).value.strip()
                 if v.isdigit() and int(v) > 0:
                     s[k] = int(v)
@@ -3370,9 +4350,48 @@ def make_app():
             s["policy_rules"] = self.q("#set-policy_rules", Switch).value
             cv = self.q("#set-colors", Select).value
             s["colors"] = cv if isinstance(cv, str) else "auto"
+            s["notifications"] = self.q("#set-notifications", Switch).value
+            ov = self.q("#set-op_view", Select).value
+            s["op_view"] = ov if isinstance(ov, str) else "inline"
+            s["hidden_profiles"] = self.settings.get("hidden_profiles", [])
             save_settings(s)
             self.settings = s
-            self.notify("settings saved (refresh interval applies after restart)")
+            self.notify("settings saved (refresh / probe intervals apply after restart)")
+
+        def export_dialog(self) -> None:
+            names = [x["name"] for x in load_configs() if not x.get("broken")]
+            if not names:
+                self.notify("no managed VPNs to export", severity="warning")
+                return
+
+            def done(v: Optional[Dict[str, Any]]) -> None:
+                if not v:
+                    return
+                data = export_bundle(v["names"], v["strip_routes"], v["strip_hosts"])
+                try:
+                    out = Path(v["path"]).expanduser()
+                    atomic_write(out, json.dumps(data, indent=2) + "\n")
+                    self.notify("✔ exported %d VPN config(s) to %s" % (len(data["vpns"]), out), timeout=6)
+                except OSError as e:
+                    self.notify("✖ %s" % e, severity="error")
+            self.push_screen(ExportForm(names), done)
+
+        def import_dialog(self) -> None:
+            def done(v: Optional[Dict[str, Any]]) -> None:
+                if not v:
+                    return
+                try:
+                    res = import_bundle(json.loads(Path(v["path"]).expanduser().read_text()), v["overwrite"])
+                except (OSError, ValueError) as e:
+                    self.notify("✖ %s" % e, severity="error")
+                    return
+                body = Text()
+                for n, what in res:
+                    body.append("%s %-20s %s\n" % ("·" if what.startswith("skipped") else "✔", n, what),
+                                style=C_MUTED if what.startswith("skipped") else C_GREEN)
+                self.push_screen(Confirm("Import result", body, yes="OK"))
+                self.live_refresh(True)
+            self.push_screen(ImportForm(), done)
 
     return MVMApp()
 
@@ -3426,6 +4445,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     lg.add_argument("-n", type=int, default=80)
     lg.add_argument("-f", "--follow", action="store_true")
     lg.add_argument("-j", "--journal", action="store_true", help="add NetworkManager / plugin journal lines")
+    pr = sub.add_parser("probes", help="health probes of a VPN: list | add T.. | rm T.. | run")
+    pr.add_argument("name")
+    pr.add_argument("action", nargs="?", choices=["list", "add", "rm", "run"])
+    pr.add_argument("items", nargs="*", help="host:port · http(s)://url · ping:host")
+    ex = sub.add_parser("export", help="export VPN configs (never secrets) to a JSON bundle")
+    ex.add_argument("names", nargs="*", help="only these VPNs (default: all)")
+    ex.add_argument("-o", "--output")
+    ex.add_argument("--strip-routes", action="store_true", help="leave out routes and probes")
+    ex.add_argument("--strip-hosts", action="store_true", help="leave out ssh remotes, hostnames and probes")
+    im = sub.add_parser("import", help="import a bundle made by export")
+    im.add_argument("file")
+    im.add_argument("--overwrite", action="store_true", help="replace configs with the same name")
+    dn = sub.add_parser("dns", help="resolve the hostnames in route lists now")
+    dn.add_argument("name", nargs="?")
     sub.add_parser("graph", help="routing map")
     sub.add_parser("foreign", help="other VPNs on this machine")
     au = sub.add_parser("autostart", help="systemd --user autostart")
@@ -3447,7 +4480,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     plain = {"doctor": cli_doctor, "bootstrap": cli_bootstrap, "up": cli_up, "down": cli_down, "restart": cli_restart, "apply": cli_apply,
              "routes": cli_routes, "adopt": cli_adopt, "new-sshuttle": cli_new_sshuttle, "delete": cli_delete, "secrets": cli_secrets,
-             "logs": cli_logs, "autostart": cli_autostart, "sudoers": cli_sudoers, "list": cli_list, "foreign": cli_foreign, "status": cli_status}
+             "logs": cli_logs, "autostart": cli_autostart, "sudoers": cli_sudoers, "list": cli_list, "foreign": cli_foreign, "status": cli_status,
+             "probes": cli_probes, "export": cli_export, "import": cli_import, "dns": cli_dns}
     if args.cmd == "colors":
         reexec_into_venv_if_needed()
         return cli_colors(args)
