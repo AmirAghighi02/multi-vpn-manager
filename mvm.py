@@ -52,13 +52,21 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 VERSION = "1.0"
-BASE = Path(__file__).resolve().parent
-SETTINGS_FILE = BASE / ".mvm.json"
-VENV_DIR = BASE / ".venv"
-CONFIGS = BASE / "configs"
-LOGS = BASE / "logs"
-STATE = BASE / "state"
-BACKUPS = BASE / "backups"
+BASE = Path(__file__).resolve().parent       # the code (and mvm.svg)
+# Data (configs, logs, state, venv) lives next to the script in a git checkout. A system-wide install
+# (the .deb under /usr) is read-only, so its data goes to the user's home instead. MVM_HOME overrides both.
+if os.environ.get("MVM_HOME"):
+    DATA = Path(os.environ["MVM_HOME"]).expanduser().resolve()
+elif str(BASE).startswith("/usr/"):
+    DATA = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "multi-vpn-manager"
+else:
+    DATA = BASE
+SETTINGS_FILE = DATA / ".mvm.json"
+VENV_DIR = DATA / ".venv"
+CONFIGS = DATA / "configs"
+LOGS = DATA / "logs"
+STATE = DATA / "state"
+BACKUPS = DATA / "backups"
 REQ_PACKAGES = ["textual>=0.86", "rich>=13.7"]
 SUDOERS_FILE = "/etc/sudoers.d/multi-vpn-manager"
 RULE_PRIO = 30          # our `to IP lookup main` policy rules sit before foreign VPN rules

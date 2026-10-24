@@ -1,0 +1,58 @@
+name: release
+
+# Every push to main builds the .deb and publishes it as a GitHub release.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deb:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check the scripts
+        run: |
+          python3 -m py_compile mvm.py
+          bash -n packaging/build-deb.sh
+
+      - name: Work out the version (mvm.py VERSION + CI run number)
+        id: ver
+        run: |
+          base="$(sed -n 's/^VERSION = "\(.*\)"/\1/p' mvm.py | head -n1)"
+          echo "version=${base}.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${base}.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Build the .deb
+        run: packaging/build-deb.sh "${{ steps.ver.outputs.version }}" dist
+
+      - name: Check the package
+        run: |
+          deb=$(ls dist/*.deb)
+          dpkg-deb -I "$deb" | sed -n '1,12p'
+          dpkg-deb -c "$deb" | grep -E "usr/bin/mvm|usr/lib/multi-vpn-manager/mvm.py"
+          tmp=$(mktemp -d)
+          dpkg-deb -x "$deb" "$tmp"
+          python3 "$tmp/usr/lib/multi-vpn-manager/mvm.py" --help >/dev/null
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.ver.outputs.tag }}" dist/*.deb \
+            --target "$GITHUB_SHA" \
+            --title "Multi-VPN Manager ${{ steps.ver.outputs.version }}" \
+            --notes "Built from \`${GITHUB_SHA::7}\` on push to \`${GITHUB_REF_NAME}\`.
+
+          Install: \`sudo apt install ./multi-vpn-manager_${{ steps.ver.outputs.version }}_all.deb\`" \
+            --latest
