@@ -414,8 +414,76 @@ def _dns_load() -> None:
             _dns = {}
 
 
+FAKE_IP_NET = ipaddress.ip_network("198.18.0.0/15")   # fake-IP range handed out by Clash-style TUN proxies (FlClash...)
+_extra_dns: List[str] = []                              # DNS servers (VPN gateways) to ask when the system resolver lies
+
+
+def _is_fake_ip(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip) in FAKE_IP_NET
+    except ValueError:
+        return False
+
+
+def _udp_dns_a(host: str, server: str, timeout: float = 2.0) -> List[str]:
+    """one raw A query to `server`; returns the IPv4 answers (empty on any failure)"""
+    import random
+    import struct
+    qid = random.randrange(65536)
+    q = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+    q += b"".join(bytes([len(x)]) + x.encode("idna") for x in host.split(".")) + b"\0" + struct.pack(">HH", 1, 1)
+    sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sk.settimeout(timeout)
+    try:
+        sk.sendto(q, (server, 53))
+        data = sk.recv(2048)
+    except OSError:
+        return []
+    finally:
+        sk.close()
+    if len(data) < 12 or struct.unpack(">H", data[:2])[0] != qid:
+        return []
+    an = struct.unpack(">H", data[6:8])[0]
+
+    def skip_name(i: int) -> int:
+        while i < len(data):
+            if data[i] & 0xC0 == 0xC0:
+                return i + 2
+            if data[i] == 0:
+                return i + 1
+            i += 1 + data[i]
+        return i
+    i = skip_name(12) + 4                      # question: name + type + class
+    out: List[str] = []
+    for _ in range(an):
+        i = skip_name(i)
+        if i + 10 > len(data):
+            break
+        typ, _cls, _ttl, rl = struct.unpack(">HHIH", data[i:i + 10])
+        i += 10
+        if typ == 1 and rl == 4:
+            out.append(socket.inet_ntoa(data[i:i + 4]))
+        i += rl
+    return out
+
+
+def _vpn_dns_servers() -> List[str]:
+    gws = list(_extra_dns)
+    for f in STATE.glob("*.json"):
+        if f.name.endswith((".probes.json",)) or f.name == DNS_CACHE_FILE.name:
+            continue
+        try:
+            gw = json.loads(f.read_text()).get("gw")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if gw and gw not in gws:
+            gws.append(gw)
+    return gws
+
+
 def resolve_host(host: str, max_age: Optional[float] = None, timeout: float = 5) -> Tuple[List[str], str]:
-    """IPv4 addresses of host (cached for settings.dns_refresh seconds). Returns (ips, error)."""
+    """IPv4 addresses of host (cached for settings.dns_refresh seconds). Returns (ips, error).
+    Fake-IP answers (198.18.0.0/15) are never used: the VPN gateways' DNS is asked instead."""
     host = host.lower().rstrip(".")
     with _dns_lock:
         _dns_load()
@@ -436,6 +504,14 @@ def resolve_host(host: str, max_age: Optional[float] = None, timeout: float = 5)
     th.start()
     th.join(timeout)
     ips, err = box_.get("ips", []), box_.get("err", "" if box_ else "DNS lookup timed out")
+    if not ips or any(_is_fake_ip(i) for i in ips):
+        real: List[str] = []
+        for srv in _vpn_dns_servers():
+            real = [i for i in _udp_dns_a(host, srv) if not _is_fake_ip(i)]
+            if real:
+                break
+        ips = sorted(set(real), key=lambda x: tuple(int(p) for p in x.split("."))) if real else []
+        err = "" if ips else "only fake-IP answers (TUN proxy DNS) and the VPN DNS has no record"
     with _dns_lock:
         if ips:
             _dns[host] = {"ips": ips, "ts": now()}
@@ -1288,7 +1364,7 @@ def clean_exclusions(routes: List[str], settings: Dict[str, Any], say: Say, keep
 
 def apply_routes(c: Dict[str, Any], iface: str, gw: str, settings: Dict[str, Any], say: Say) -> Dict[str, Any]:
     """add our split-tunnel routes; returns the state record of what we added"""
-    routes = resolve_for_apply(c, say)
+    routes = resolve_for_apply(c, say, gw)
     clean_exclusions(routes, settings, say, keep_dev=iface)
     rc, _, err = priv([IP, "-4", "route", "del", "default", "dev", iface])
     if rc == 0:
@@ -1321,8 +1397,10 @@ def apply_routes(c: Dict[str, Any], iface: str, gw: str, settings: Dict[str, Any
     return {"routes": added, "rules": rules}
 
 
-def resolve_for_apply(c: Dict[str, Any], say: Say) -> List[str]:
+def resolve_for_apply(c: Dict[str, Any], say: Say, gw: str = "") -> List[str]:
     """expand the route list for the kernel; hostnames are looked up fresh (falls back to the last known IPs)"""
+    if gw and gw not in _extra_dns:
+        _extra_dns.append(gw)
     for h in host_entries(c.get("routes", [])):
         ips, err = resolve_host(h, max_age=0)
         if ips:
